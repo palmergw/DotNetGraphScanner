@@ -167,8 +167,37 @@ public static class EntryPointDetector
         return cls.Name.EndsWith("Controller", StringComparison.Ordinal);
     }
 
-    internal static string SymbolId(ISymbol sym) =>
-        sym.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
+    // Includes parameter types so overloads are distinct, and containing-type
+    // so nested classes are disambiguated.
+    private static readonly SymbolDisplayFormat MemberIdFormat = new(
+        globalNamespaceStyle:    SymbolDisplayGlobalNamespaceStyle.Included,
+        typeQualificationStyle:  SymbolDisplayTypeQualificationStyle.NameAndContainingTypesAndNamespaces,
+        genericsOptions:         SymbolDisplayGenericsOptions.IncludeTypeParameters,
+        memberOptions:           SymbolDisplayMemberOptions.IncludeParameters
+                               | SymbolDisplayMemberOptions.IncludeContainingType
+                               | SymbolDisplayMemberOptions.IncludeExplicitInterface,
+        parameterOptions:        SymbolDisplayParameterOptions.IncludeType,
+        miscellaneousOptions:    SymbolDisplayMiscellaneousOptions.EscapeKeywordIdentifiers
+                               | SymbolDisplayMiscellaneousOptions.UseSpecialTypes);
+
+    /// <summary>
+    /// Returns a stable, unique string ID for any Roslyn symbol.
+    /// Methods and properties include the parameter-type list so overloads are
+    /// distinct. For symbols declared inside the current solution the containing
+    /// assembly name is also prepended, so e.g. two projects that both define
+    /// <c>class Program { static void Main() }</c> in the global namespace get
+    /// different IDs.
+    /// </summary>
+    internal static string SymbolId(ISymbol sym)
+    {
+        if (sym is IMethodSymbol or IPropertySymbol)
+        {
+            var fq  = sym.ToDisplayString(MemberIdFormat);
+            var asm = sym.ContainingAssembly?.Name;
+            return asm is not null ? $"{asm}#{fq}" : fq;
+        }
+        return sym.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
+    }
 
     internal static void EnsureMethodNode(GraphModel graph, IMethodSymbol sym, string id)
     {
