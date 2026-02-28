@@ -1,0 +1,25 @@
+namespace DotNetGraphScanner.Graph;
+
+public enum EdgeKind
+{
+    /// <summary>Parent→child containment (e.g. Project → Class, Class → Method).</summary>
+    Contains,
+
+    /// <summary>Method A invokes Method B.</summary>
+    Calls,
+
+    /// <summary>Class inherits from another class.</summary>
+    Inherits,
+
+    /// <summary>Class implements an interface.</summary>
+    Implements,
+
+    /// <summary>Project references another project.</summary>
+    ProjectReference,
+
+    /// <summary>Project depends on a NuGet package.</summary>
+    PackageReference,
+
+    /// <summary>Marks a node that is a known entry-point.</summary>
+    EntryPoint
+}
