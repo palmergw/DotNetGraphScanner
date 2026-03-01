@@ -41,6 +41,16 @@ dotnet run -- path/to/MyApp.csproj --output ./out --cypher
 start ./out/MyApp.graph.html
 ```
 
+### Build Graph
+```
+.\bin\Debug\net8.0\dotnet-graph-scanner scan .\DotNetGraphScanner.csproj --output .\out
+```
+
+### Build Visualization
+```
+.\bin\Debug\net8.0\dotnet-graph-scanner render .\out\DotNetGraphScanner.graph.json --output .\out
+```
+
 ---
 
 ## Options

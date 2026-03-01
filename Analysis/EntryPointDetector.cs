@@ -312,12 +312,19 @@ public static class EntryPointDetector
 
     internal static void EnsureMethodNode(GraphModel graph, IMethodSymbol sym, string id)
     {
-        if (graph.HasNode(id)) return;
-        graph.AddNode(id, sym.Name, NodeKind.Method, meta: new()
+        var node = graph.AddNode(id, sym.Name, NodeKind.Method, meta: new()
         {
             ["fullName"] = sym.ToDisplayString(),
             ["returnType"] = sym.ReturnType.ToDisplayString()
         });
+        // Promote: if a call-graph pass created this node as an external placeholder
+        // before the declaration was visited, clear the flag now that we know it is local.
+        if (node.Meta.TryGetValue("isExternal", out var wasExt) && wasExt == "true")
+        {
+            node.Meta.Remove("isExternal");
+            node.Meta["fullName"] = sym.ToDisplayString();
+            node.Meta["returnType"] = sym.ReturnType.ToDisplayString();
+        }
     }
 
     private static string StripSuffix(string name, string suffix) =>

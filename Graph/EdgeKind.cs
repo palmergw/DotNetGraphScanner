@@ -21,5 +21,8 @@ public enum EdgeKind
     PackageReference,
 
     /// <summary>Marks a node that is a known entry-point.</summary>
-    EntryPoint
+    EntryPoint,
+
+    /// <summary>Method reads or writes a property.</summary>
+    Accesses
 }

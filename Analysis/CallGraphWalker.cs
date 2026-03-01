@@ -62,6 +62,32 @@ public sealed class CallGraphWalker : CSharpSyntaxWalker
         base.VisitLocalFunctionStatement(node);
     }
 
+    public override void VisitMemberAccessExpression(MemberAccessExpressionSyntax node)
+    {
+        if (_currentMethod is not null)
+        {
+            var info = _model.GetSymbolInfo(node);
+            var sym = (info.Symbol ?? info.CandidateSymbols.FirstOrDefault()) as IPropertySymbol;
+            if (sym is not null)
+            {
+                var callerId = EntryPointDetector.SymbolId(_currentMethod);
+                var propId   = EntryPointDetector.SymbolId(sym);
+                EntryPointDetector.EnsureMethodNode(_graph, _currentMethod, callerId);
+                if (!_graph.HasNode(propId))
+                {
+                    _graph.AddNode(propId, sym.Name, NodeKind.Property, meta: new()
+                    {
+                        ["fullName"]   = sym.ToDisplayString(),
+                        ["isExternal"] = "true",
+                        ["type"]       = sym.Type.ToDisplayString()
+                    });
+                }
+                _graph.AddEdge(callerId, propId, EdgeKind.Accesses);
+            }
+        }
+        base.VisitMemberAccessExpression(node);
+    }
+
     public override void VisitInvocationExpression(InvocationExpressionSyntax node)
     {
         if (_currentMethod is not null)

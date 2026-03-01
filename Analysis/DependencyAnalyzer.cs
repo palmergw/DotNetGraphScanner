@@ -34,11 +34,21 @@ public static class DependencyAnalyzer
                 _                  => NodeKind.Class
             };
 
-            graph.AddNode(typeId, sym.Name, nodeKind, meta: new()
+            var typeNode = graph.AddNode(typeId, sym.Name, nodeKind, meta: new()
             {
                 ["namespace"] = sym.ContainingNamespace?.ToDisplayString() ?? "",
                 ["fullName"]  = sym.ToDisplayString()
             });
+            // Promote: if this node was previously created as an external placeholder
+            // (e.g. seen as an implemented interface before its own file was processed),
+            // clear the flag and set the proper metadata now that we have the declaration.
+            if (typeNode.Meta.TryGetValue("isExternal", out var wasExt) && wasExt == "true")
+            {
+                typeNode.Meta.Remove("isExternal");
+                typeNode.Meta["namespace"] = sym.ContainingNamespace?.ToDisplayString() ?? "";
+                typeNode.Meta["fullName"]  = sym.ToDisplayString();
+                typeNode.Kind = nodeKind;
+            }
 
             // Namespace node
             var ns = sym.ContainingNamespace;
@@ -85,14 +95,18 @@ public static class DependencyAnalyzer
                 }
                 else if (member is IPropertySymbol ps)
                 {
-                    var propId = EntryPointDetector.SymbolId(ps);
-                    if (!graph.HasNode(propId))
+                    var propId  = EntryPointDetector.SymbolId(ps);
+                    var propNode = graph.AddNode(propId, ps.Name, NodeKind.Property, meta: new()
                     {
-                        graph.AddNode(propId, ps.Name, NodeKind.Property, meta: new()
-                        {
-                            ["fullName"] = ps.ToDisplayString(),
-                            ["type"] = ps.Type.ToDisplayString()
-                        });
+                        ["fullName"] = ps.ToDisplayString(),
+                        ["type"]     = ps.Type.ToDisplayString()
+                    });
+                    // Promote: CallGraphWalker may have pre-created this as an external placeholder.
+                    if (propNode.Meta.TryGetValue("isExternal", out var propWasExt) && propWasExt == "true")
+                    {
+                        propNode.Meta.Remove("isExternal");
+                        propNode.Meta["fullName"] = ps.ToDisplayString();
+                        propNode.Meta["type"]     = ps.Type.ToDisplayString();
                     }
                     graph.AddEdge(typeId, propId, EdgeKind.Contains);
                 }

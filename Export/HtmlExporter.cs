@@ -27,16 +27,9 @@ public sealed class HtmlExporter : IGraphExporter
 
     public Task ExportAsync(GraphModel graph, string outputPath, CancellationToken ct = default)
     {
-        // Filter nodes/edges if not including external
-        var nodes = graph.Nodes.Values
-            .Where(n => _includeExternalNodes ||
-                        !(n.Meta.TryGetValue("isExternal", out var ext) && ext == "true"))
-            .ToList();
-
-        var nodeIds = nodes.Select(n => n.Id).ToHashSet();
-        var edges = graph.Edges
-            .Where(e => nodeIds.Contains(e.SourceId) && nodeIds.Contains(e.TargetId))
-            .ToList();
+        // Always embed all nodes/edges — the JS "Show External" checkbox toggles visibility live.
+        var nodes = graph.Nodes.Values.ToList();
+        var edges = graph.Edges.ToList();
 
         var nodesJson = JsonSerializer.Serialize(nodes.Select(n => new
         {
@@ -155,11 +148,19 @@ public sealed class HtmlExporter : IGraphExporter
 
   ::-webkit-scrollbar { width: 6px; } ::-webkit-scrollbar-track { background: #1e2130; }
   ::-webkit-scrollbar-thumb { background: #2d3348; border-radius: 3px; }
+
+  /* Hierarchy view */
+  #hier-view { position: absolute; inset: 0; overflow: hidden; display: none; }
+  #hier-svg  { width: 100%; height: 100%; cursor: grab; }
+  #hier-svg.hier-panning { cursor: grabbing; }
+  .h-box { cursor: pointer; }
+  .h-box:hover .h-header-rect { filter: brightness(1.25); }
 </style>
 </head>
 <body>
 <div id="canvas-wrap">
   <canvas id="gc"></canvas>
+  <div id="hier-view"><svg id="hier-svg"></svg></div>
   <div id="loading-overlay">
     <div id="loading-card">
       <div id="loading-spinner"></div>
@@ -168,12 +169,20 @@ public sealed class HtmlExporter : IGraphExporter
     </div>
   </div>
   <div id="toolbar">
-    <button onclick="resetZoom()">⟳ Reset View</button>
-    <button onclick="toggleLabels()">Labels</button>
-    <button id="freeze-btn" onclick="toggleFreeze()" title="Freeze/resume force layout">❄ Freeze</button>
-    <label>
+    <select id="view-mode" onchange="switchView(this.value)" title="Switch visualization style" style="font-weight:600">
+      <option value="force">⚡ Force Graph</option>
+      <option value="hierarchy">▦ Hierarchy</option>
+    </select>
+    <button class="force-only" onclick="resetZoom()">⟳ Reset</button>
+    <button class="force-only" onclick="toggleLabels()">Labels</button>
+    <button id="freeze-btn" class="force-only" onclick="toggleFreeze()" title="Freeze/resume force layout">❄ Freeze</button>
+    <label class="force-only">
       Force: <input type="range" id="force-slider" min="50" max="600" value="250" oninput="updateForce(+this.value)">
     </label>
+    <button class="hier-only" style="display:none" onclick="resetHierZoom()">⟳ Reset</button>
+    <button class="hier-only" style="display:none" onclick="hierExpandAll(2)">↕ 2 Levels</button>
+    <button class="hier-only" style="display:none" onclick="hierExpandAll(3)">↕ 3 Levels</button>
+    <button class="hier-only" style="display:none" onclick="hierCollapseAll()">⟵ Collapse</button>
     <select id="kind-filter" onchange="applyFilter()">
       <option value="">All Kinds</option>
     </select>
@@ -261,6 +270,7 @@ const COLOR = {
 const EDGE_COLOR = {
   Calls:'#475569', Contains:'#1e3a5f', Inherits:'#7c3aed', Implements:'#d97706',
   ProjectReference:'#3b82f6', PackageReference:'#f97316', EntryPoint:'#f59e0b',
+  Accesses:'#334155',
 };
 const RADIUS = {
   Solution:18, Project:16, Namespace:12, Class:11, Interface:11, Struct:10,
@@ -718,6 +728,10 @@ function debouncedFilter() {
 }
 
 function applyFilter() {
+  if (currentView === 'hierarchy') {
+    if (hierInitDone) { layoutHierarchy(); renderHierarchy(); }
+    return;
+  }
   const kindVal = document.getElementById('kind-filter').value;
   const search  = document.getElementById('search-input').value.toLowerCase();
   const showExt = document.getElementById('ext-toggle').checked;
@@ -996,6 +1010,280 @@ kinds.forEach(k => {
 { const item=document.createElement('div'); item.className='legend-item';
   item.innerHTML=`<div class="dot entry" style="background:transparent"></div><span>Entry Point</span>`;
   legend.appendChild(item); }
+
+// ── View mode ─────────────────────────────────────────────────────────────────
+let currentView = 'force';
+function switchView(mode) {
+  if (currentView === mode) return;
+  currentView = mode;
+  const gc = document.getElementById('gc');
+  const loadOv = document.getElementById('loading-overlay');
+  const hierView = document.getElementById('hier-view');
+  const showForce = mode === 'force';
+  gc.style.display = showForce ? '' : 'none';
+  if (!showForce) loadOv.style.display = 'none';
+  else if (simRunning) loadOv.classList.remove('hidden');
+  hierView.style.display = showForce ? 'none' : 'block';
+  document.querySelectorAll('.force-only').forEach(el => el.style.display = showForce ? '' : 'none');
+  document.querySelectorAll('.hier-only').forEach(el => el.style.display = showForce ? 'none' : '');
+  if (!showForce) {
+    if (!hierInitDone) { initHierarchy(); hierInitDone = true; }
+    layoutHierarchy();
+    renderHierarchy();
+  } else {
+    markDirty();
+  }
+}
+
+// ── Hierarchy constants ───────────────────────────────────────────────────────
+const HIER_H  = 30;   // header height
+const HIER_MW = 180;  // min box width
+const HIER_P  = 10;   // padding inside container
+const HIER_G  = 5;    // gap between siblings
+const HIER_RG = 20;   // gap between roots
+const HIER_KIND_ORDER = ['Solution','Project','Namespace','Class','Interface','Struct','Enum',
+                          'Method','Property','NuGetPackage','ExternalType'];
+const HIER_OPEN_KINDS  = new Set(['Solution','Project']);
+const HIER_STRUCTURAL  = new Set(['Solution','Project','Namespace','Class','Interface',
+                                   'Struct','Enum','NuGetPackage','ExternalType']);
+let hierInitDone = false;
+let hierTree   = {};  // id→{id,children[],parent}
+let hierState  = {};  // id→{collapsed:bool}
+let hierLayout = {};  // id→{x,y,w,h}
+let hierRoots  = [];
+let showHierExt = false;
+let hierZoom = null, hierTransform = d3.zoomIdentity;
+
+// ── Hierarchy: build tree ─────────────────────────────────────────────────────
+function initHierarchy() {
+  const childMap = {}, parentMap = {};
+  RAW_EDGES.forEach(e => {
+    if (e.kind !== 'Contains') return;
+    const s = e.source?.id ?? e.source, t = e.target?.id ?? e.target;
+    if (!childMap[s]) childMap[s] = [];
+    childMap[s].push(t);
+    parentMap[t] = s;
+  });
+  hierTree = {};
+  RAW_NODES.forEach(n => {
+    hierTree[n.id] = { id: n.id, children: (childMap[n.id]||[]).slice(), parent: parentMap[n.id]||null };
+  });
+  const kindRank = k => { const i=HIER_KIND_ORDER.indexOf(k); return i<0?99:i; };
+  Object.values(hierTree).forEach(hn => {
+    hn.children.sort((a,b) => {
+      const na=nodeById[a], nb=nodeById[b];
+      const d=kindRank(na?.kind)-kindRank(nb?.kind);
+      return d!==0?d:(na?.label||'').localeCompare(nb?.label||'');
+    });
+  });
+  hierRoots = RAW_NODES
+    .filter(n => !parentMap[n.id] && (HIER_STRUCTURAL.has(n.kind)||(childMap[n.id]||[]).length>0))
+    .map(n => n.id);
+  hierRoots.sort((a,b) => {
+    const na=nodeById[a], nb=nodeById[b];
+    const d=kindRank(na?.kind)-kindRank(nb?.kind);
+    return d!==0?d:(na?.label||'').localeCompare(nb?.label||'');
+  });
+  hierState = {};
+  RAW_NODES.forEach(n => { hierState[n.id]={collapsed:!HIER_OPEN_KINDS.has(n.kind)}; });
+}
+
+// ── Hierarchy: layout ─────────────────────────────────────────────────────────
+function hierVisKids(id) {
+  return (hierTree[id]?.children||[]).filter(cid => {
+    const cn=nodeById[cid];
+    return cn && (showHierExt || cn.meta?.isExternal!=='true');
+  });
+}
+
+function hierSize(id) {
+  const n=nodeById[id];
+  const label=n?.label||id;
+  const baseW=Math.max(HIER_MW, Math.min(label.length*7+56, 320));
+  const kids=hierVisKids(id);
+  if ((hierState[id]?.collapsed??true)||kids.length===0) return {w:baseW,h:HIER_H};
+  const cs=kids.map(cid=>hierSize(cid));
+  const maxCW=cs.reduce((m,s)=>Math.max(m,s.w),0);
+  const totCH=cs.reduce((s,c)=>s+c.h,0)+Math.max(0,kids.length-1)*HIER_G;
+  return {w:Math.max(baseW,maxCW+HIER_P*2), h:HIER_H+HIER_P+totCH+HIER_P};
+}
+
+function hierPos(id,x,y,w) {
+  const lay={x,y,w,h:HIER_H}; hierLayout[id]=lay;
+  const kids=hierVisKids(id);
+  if ((hierState[id]?.collapsed??true)||kids.length===0) return lay;
+  const cw=Math.max(w-HIER_P*2,HIER_MW);
+  let cy=y+HIER_H+HIER_P;
+  kids.forEach(cid=>{ const cl=hierPos(cid,x+HIER_P,cy,cw); cy+=cl.h+HIER_G; });
+  lay.h=cy-y-HIER_G+HIER_P; return lay;
+}
+
+function layoutHierarchy() {
+  hierLayout={};
+  showHierExt=document.getElementById('ext-toggle').checked;
+  let x=HIER_P;
+  const visRoots=hierRoots.filter(id=>showHierExt||nodeById[id]?.meta?.isExternal!=='true');
+  visRoots.forEach(id=>{ const sz=hierSize(id); hierPos(id,x,HIER_P,sz.w); x+=sz.w+HIER_RG; });
+}
+
+// ── Hierarchy: visible ancestor ───────────────────────────────────────────────
+function hierVisAnc(id) {
+  let shallowest=null, cur=hierTree[id]?.parent;
+  while (cur) { if (hierState[cur]?.collapsed) shallowest=cur; cur=hierTree[cur]?.parent; }
+  return shallowest??id;
+}
+
+// ── Hierarchy: render ─────────────────────────────────────────────────────────
+const SVGNS='http://www.w3.org/2000/svg';
+function hEl(tag,attrs,txt) {
+  const el=document.createElementNS(SVGNS,tag);
+  if (attrs) Object.entries(attrs).forEach(([k,v])=>el.setAttribute(k,String(v)));
+  if (txt!=null) el.textContent=txt;
+  return el;
+}
+
+function renderHierarchy() {
+  const svg=document.getElementById('hier-svg');
+  if (!svg.querySelector('defs')) {
+    const defs=hEl('defs',{});
+    defs.innerHTML=`<marker id="ha" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">`+
+      `<path d="M0,0 L0,7 L7,3.5Z" fill="#475569" fill-opacity="0.8"/></marker>`;
+    svg.appendChild(defs);
+  }
+  ['hier-g-edges','hier-g-boxes'].forEach(id=>{ const e=document.getElementById(id); if(e)e.remove(); });
+  const gEdges=hEl('g',{id:'hier-g-edges'}), gBoxes=hEl('g',{id:'hier-g-boxes'});
+  svg.appendChild(gEdges); svg.appendChild(gBoxes);
+  const tf=hierTransform.toString();
+  gEdges.setAttribute('transform',tf); gBoxes.setAttribute('transform',tf);
+
+  // Collect rendered ids
+  const rendered=new Set();
+  function collectRendered(id) {
+    if (!hierLayout[id]) return;
+    rendered.add(id);
+    if (!(hierState[id]?.collapsed??true)) hierVisKids(id).forEach(cid=>collectRendered(cid));
+  }
+  hierRoots.forEach(id=>collectRendered(id));
+
+  // Draw boxes recursively
+  function drawBox(id) {
+    const lay=hierLayout[id]; if(!lay) return;
+    const n=nodeById[id];
+    const color=COLOR[n?.kind]||'#64748b';
+    const kids=hierVisKids(id);
+    const hasKids=kids.length>0;
+    const collapsed=hierState[id]?.collapsed??true;
+    const g=hEl('g',{class:'h-box'}); g.dataset.id=id;
+    // Container fill (expanded)
+    if (!collapsed&&hasKids) {
+      g.appendChild(hEl('rect',{x:lay.x,y:lay.y,width:lay.w,height:lay.h,rx:8,
+        fill:color+'0e',stroke:color+'33','stroke-width':'1'}));
+    }
+    // Header
+    g.appendChild(hEl('rect',{class:'h-header-rect',
+      x:lay.x,y:lay.y,width:lay.w,height:HIER_H,
+      rx:(!collapsed&&hasKids)?0:7,
+      fill:color+'26',stroke:color+'99','stroke-width':'1'}));
+    // Top-rounded cap redrawn over the opened header to fix corners
+    if (!collapsed&&hasKids) {
+      g.appendChild(hEl('path',{
+        d:`M${lay.x+7},${lay.y} Q${lay.x},${lay.y} ${lay.x},${lay.y+7}`+
+          ` L${lay.x},${lay.y+HIER_H} L${lay.x+lay.w},${lay.y+HIER_H}`+
+          ` L${lay.x+lay.w},${lay.y+7} Q${lay.x+lay.w},${lay.y} ${lay.x+lay.w-7},${lay.y} Z`,
+        fill:color+'26',stroke:color+'99','stroke-width':'1','pointer-events':'none'}));
+    }
+    // Selection ring
+    if (id===selectedId) {
+      g.appendChild(hEl('rect',{x:lay.x-2,y:lay.y-2,width:lay.w+4,height:HIER_H+4,
+        rx:9,fill:'none',stroke:'#3b82f6','stroke-width':'2',style:'pointer-events:none'}));
+    }
+    // Entry-point glow
+    if (n?.isEntryPoint) {
+      g.appendChild(hEl('rect',{x:lay.x-1,y:lay.y-1,width:lay.w+2,height:HIER_H+2,
+        rx:8,fill:'none',stroke:'#f59e0b','stroke-width':'1.5',style:'pointer-events:none'}));
+    }
+    // Toggle chevron
+    if (hasKids) {
+      g.appendChild(hEl('text',{x:lay.x+11,y:lay.y+HIER_H/2,'dominant-baseline':'central',
+        'font-size':'9',fill:color,'font-family':'monospace',style:'pointer-events:none'},
+        collapsed?'▶':'▼'));
+    }
+    // Label
+    g.appendChild(hEl('text',{x:lay.x+(hasKids?26:12),y:lay.y+HIER_H/2,
+      'dominant-baseline':'central','font-size':'12',
+      'font-family':"'Segoe UI',system-ui,sans-serif",
+      fill:n?.isEntryPoint?'#fcd34d':'#e2e8f0',
+      'font-weight':n?.isEntryPoint?'700':'400',
+      style:'pointer-events:none'},n?.label||id));
+    // Kind badge
+    g.appendChild(hEl('text',{x:lay.x+lay.w-7,y:lay.y+HIER_H/2,
+      'dominant-baseline':'central','text-anchor':'end','font-size':'9',
+      'font-family':"'Segoe UI',system-ui,sans-serif",fill:color+'99',
+      style:'pointer-events:none'},n?.kind||''));
+    g.style.cursor='pointer';
+    g.addEventListener('click',ev=>{
+      ev.stopPropagation();
+      if (hasKids) { hierState[id].collapsed=!hierState[id].collapsed; layoutHierarchy(); renderHierarchy(); }
+      else { selectNode(id); renderHierarchy(); }
+    });
+    gBoxes.appendChild(g);
+    if (!collapsed) kids.forEach(cid=>drawBox(cid));
+  }
+  hierRoots.forEach(id=>drawBox(id));
+
+  // Draw non-Contains edges (terminated at visible ancestors)
+  const drawn=new Set();
+  RAW_EDGES.forEach(e=>{
+    if (e.kind==='Contains') return;
+    const src=hierVisAnc(e.source?.id??e.source);
+    const tgt=hierVisAnc(e.target?.id??e.target);
+    if (src===tgt||!rendered.has(src)||!rendered.has(tgt)) return;
+    const key=src+'\u21d2'+tgt;
+    if (drawn.has(key)) return;
+    drawn.add(key);
+    const sL=hierLayout[src], tL=hierLayout[tgt];
+    if (!sL||!tL) return;
+    const ec=EDGE_COLOR[e.kind]||'#475569';
+    const goRight=(sL.x+sL.w/2)<(tL.x+tL.w/2);
+    const x1=goRight?sL.x+sL.w:sL.x, y1=sL.y+HIER_H/2;
+    const x2=goRight?tL.x:tL.x+tL.w, y2=tL.y+HIER_H/2;
+    const dx=Math.max(Math.abs(x2-x1)*0.45,30);
+    const cx1=goRight?x1+dx:x1-dx, cx2=goRight?x2-dx:x2+dx;
+    gEdges.appendChild(hEl('path',{
+      d:`M${x1},${y1} C${cx1},${y1} ${cx2},${y2} ${x2},${y2}`,
+      stroke:ec,'stroke-width':'1.2',fill:'none',
+      'stroke-opacity':'0.45','marker-end':'url(#ha)'}));
+  });
+
+  // Attach zoom (once)
+  if (!hierZoom) {
+    hierZoom=d3.zoom().scaleExtent([0.03,8]).on('zoom',({transform})=>{
+      hierTransform=transform;
+      document.getElementById('hier-g-edges')?.setAttribute('transform',transform);
+      document.getElementById('hier-g-boxes')?.setAttribute('transform',transform);
+    });
+    d3.select('#hier-svg').call(hierZoom).on('dblclick.zoom',null);
+  }
+}
+
+function resetHierZoom() {
+  if (hierZoom) d3.select('#hier-svg').transition().duration(500).call(hierZoom.transform,d3.zoomIdentity);
+}
+
+function hierExpandAll(depth) {
+  function walk(id,d) {
+    hierState[id]={collapsed:d>=depth};
+    if (d<depth) hierVisKids(id).forEach(cid=>walk(cid,d+1));
+  }
+  hierRoots.forEach(id=>walk(id,0));
+  layoutHierarchy(); renderHierarchy();
+}
+
+function hierCollapseAll() {
+  Object.values(hierState).forEach(s=>s.collapsed=true);
+  hierRoots.forEach(id=>{ if(hierState[id]) hierState[id].collapsed=false; });
+  layoutHierarchy(); renderHierarchy();
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function escHtml(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
