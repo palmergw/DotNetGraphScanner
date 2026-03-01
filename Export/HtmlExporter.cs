@@ -64,6 +64,26 @@ public sealed class HtmlExporter : IGraphExporter
         return Task.CompletedTask;
     }
 
+    public static async Task RenderFromJsonAsync(
+        string jsonPath, string htmlPath, CancellationToken ct = default)
+    {
+        var json = await File.ReadAllTextAsync(jsonPath, ct);
+        using var doc = System.Text.Json.JsonDocument.Parse(json);
+        var root = doc.RootElement;
+
+        // Re-serialise the two arrays as compact JSON strings so they can be
+        // embedded verbatim in the HTML template.
+        var nodesJson = root.TryGetProperty("nodes", out var nEl)
+            ? nEl.GetRawText() : "[]";
+        var edgesJson = root.TryGetProperty("edges", out var eEl)
+            ? eEl.GetRawText() : "[]";
+
+        var title = Path.GetFileNameWithoutExtension(htmlPath);
+        var html  = BuildHtml(nodesJson, edgesJson, title);
+        await File.WriteAllTextAsync(htmlPath, html, System.Text.Encoding.UTF8, ct);
+        Console.WriteLine($"  HTML  → {htmlPath}");
+    }
+
     private static string BuildHtml(string nodesJson, string edgesJson, string title) => $$"""
 <!DOCTYPE html>
 <html lang="en">
