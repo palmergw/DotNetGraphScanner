@@ -55,9 +55,13 @@ public static class EntryPointDetector
         {
             var clsSym = model.GetDeclaredSymbol(cls) as INamedTypeSymbol;
             if (clsSym is null) continue;
+            if (!IsController(clsSym)) continue;
 
-            bool isController = IsController(clsSym);
-            if (!isController) continue;
+            // Class-level [Route("prefix")] — used to build the full path
+            var classRoute = GetFirstRouteTemplate(clsSym.GetAttributes());
+            var controllerName = clsSym.Name.EndsWith("Controller", StringComparison.Ordinal)
+                ? clsSym.Name[..^"Controller".Length]
+                : clsSym.Name;
 
             foreach (var method in cls.Members.OfType<MethodDeclarationSyntax>())
             {
@@ -66,15 +70,40 @@ public static class EntryPointDetector
                 var mSym = model.GetDeclaredSymbol(method);
                 if (mSym is null) continue;
 
-                bool hasVerb = mSym.GetAttributes().Any(a =>
-                    a.AttributeClass is not null &&
-                    HttpVerbAttributes.Contains(StripSuffix(a.AttributeClass.Name, "Attribute")));
+                // Collect HTTP verb + optional route template from all verb/route attrs
+                string? httpVerb = null;
+                string? methodRoute = null;
 
-                if (!hasVerb) continue;
+                foreach (var attr in mSym.GetAttributes())
+                {
+                    if (attr.AttributeClass is null) continue;
+                    var attrName = StripSuffix(attr.AttributeClass.Name, "Attribute");
+                    if (!HttpVerbAttributes.Contains(attrName)) continue;
+
+                    if (attrName != "Route")
+                        httpVerb ??= attrName.Replace("Http", "", StringComparison.OrdinalIgnoreCase)
+                                             .ToUpperInvariant();
+
+                    // First string constructor argument is the route template
+                    if (methodRoute is null &&
+                        attr.ConstructorArguments.Length > 0 &&
+                        attr.ConstructorArguments[0].Value is string t)
+                        methodRoute = t;
+                }
+
+                if (httpVerb is null && methodRoute is null) continue; // no verb/route attr
 
                 var id = SymbolId(mSym);
                 EnsureMethodNode(graph, mSym, id);
-                graph.Nodes[id].IsEntryPoint = true;
+                var node = graph.Nodes[id];
+                node.IsEntryPoint = true;
+
+                if (httpVerb is not null)
+                    node.Meta["httpMethod"] = httpVerb;
+
+                node.Meta["routeTemplate"] = BuildControllerRoute(
+                    classRoute, methodRoute, controllerName, mSym.Name);
+
                 graph.AddEdge(projectId, id, EdgeKind.EntryPoint);
             }
         }
@@ -82,45 +111,66 @@ public static class EntryPointDetector
         // ── Minimal API (MapGet / MapPost etc.) ──────────────────────────────
         foreach (var inv in root.DescendantNodes().OfType<InvocationExpressionSyntax>())
         {
-            string? methodName = inv.Expression switch
+            string? mapMethod = inv.Expression switch
             {
                 MemberAccessExpressionSyntax ma => ma.Name.Identifier.Text,
-                IdentifierNameSyntax id => id.Identifier.Text,
+                IdentifierNameSyntax idn        => idn.Identifier.Text,
                 _ => null
             };
 
-            if (methodName is null || !MinimalApiMethods.Contains(methodName)) continue;
+            if (mapMethod is null || !MinimalApiMethods.Contains(mapMethod)) continue;
 
-            // Mark the node containing this invocation as the entry point
-            // (the invocation site – often the Program.cs scope), but also try to
-            // resolve any lambda/method-group argument as the handler.
-            foreach (var arg in inv.ArgumentList.Arguments)
+            var args = inv.ArgumentList.Arguments;
+
+            // First argument is the route pattern string
+            string? routePattern = null;
+            if (args.Count > 0)
+            {
+                var cv = model.GetConstantValue(args[0].Expression);
+                if (cv.HasValue && cv.Value is string rp) routePattern = rp;
+            }
+
+            string? httpVerb = mapMethod switch
+            {
+                "MapGet"    => "GET",
+                "MapPost"   => "POST",
+                "MapPut"    => "PUT",
+                "MapDelete" => "DELETE",
+                "MapPatch"  => "PATCH",
+                _ => null
+            };
+
+            // Remaining arguments — look for lambdas and method-group handlers
+            foreach (var arg in args.Skip(1))
             {
                 var argExpr = arg.Expression;
-                ISymbol? handlerSym = null;
 
                 if (argExpr is AnonymousMethodExpressionSyntax or
                     SimpleLambdaExpressionSyntax or
                     ParenthesizedLambdaExpressionSyntax)
                 {
-                    // Create a synthetic node for this anonymous handler
-                    var locationStr = $"{tree.FilePath}:{argExpr.GetLocation().GetLineSpan().StartLinePosition.Line + 1}";
-                    var nodeId = $"lambda:{locationStr}";
-                    var label = $"λ {methodName} handler @ {System.IO.Path.GetFileName(tree.FilePath)}:{argExpr.GetLocation().GetLineSpan().StartLinePosition.Line + 1}";
-                    graph.AddNode(nodeId, label, NodeKind.Method, isEntryPoint: true,
-                        meta: new() { ["file"] = tree.FilePath, ["routeMethod"] = methodName });
+                    var line = argExpr.GetLocation().GetLineSpan().StartLinePosition.Line + 1;
+                    var nodeId = $"lambda:{tree.FilePath}:{line}";
+                    var label  = routePattern is not null
+                        ? $"λ {mapMethod} {routePattern} @ {System.IO.Path.GetFileName(tree.FilePath)}:{line}"
+                        : $"λ {mapMethod} handler @ {System.IO.Path.GetFileName(tree.FilePath)}:{line}";
+
+                    var meta = new Dictionary<string, string> { ["file"] = tree.FilePath };
+                    if (httpVerb is not null)    meta["httpMethod"]     = httpVerb;
+                    if (routePattern is not null) meta["routeTemplate"] = routePattern;
+
+                    graph.AddNode(nodeId, label, NodeKind.Method, isEntryPoint: true, meta: meta);
                     graph.AddEdge(projectId, nodeId, EdgeKind.EntryPoint);
                 }
-                else
+                else if (model.GetSymbolInfo(argExpr).Symbol is IMethodSymbol ms)
                 {
-                    handlerSym = model.GetSymbolInfo(argExpr).Symbol;
-                    if (handlerSym is IMethodSymbol ms)
-                    {
-                        var id = SymbolId(ms);
-                        EnsureMethodNode(graph, ms, id);
-                        graph.Nodes[id].IsEntryPoint = true;
-                        graph.AddEdge(projectId, id, EdgeKind.EntryPoint);
-                    }
+                    var id   = SymbolId(ms);
+                    EnsureMethodNode(graph, ms, id);
+                    var node = graph.Nodes[id];
+                    node.IsEntryPoint = true;
+                    if (httpVerb is not null)    node.Meta["httpMethod"]     = httpVerb;
+                    if (routePattern is not null) node.Meta["routeTemplate"] = routePattern;
+                    graph.AddEdge(projectId, id, EdgeKind.EntryPoint);
                 }
             }
         }
@@ -131,15 +181,23 @@ public static class EntryPointDetector
             var sym = model.GetDeclaredSymbol(method);
             if (sym is null) continue;
 
-            bool isFn = sym.GetAttributes().Any(a =>
-                a.AttributeClass is not null &&
-                (StripSuffix(a.AttributeClass.Name, "Attribute") == "FunctionName"));
-
-            if (!isFn) continue;
+            string? fnName = null;
+            foreach (var attr in sym.GetAttributes())
+            {
+                if (attr.AttributeClass is null) continue;
+                if (StripSuffix(attr.AttributeClass.Name, "Attribute") != "FunctionName") continue;
+                fnName = attr.ConstructorArguments.Length > 0
+                    ? attr.ConstructorArguments[0].Value as string
+                    : null;
+                break;
+            }
+            if (fnName is null) continue;
 
             var id = SymbolId(sym);
             EnsureMethodNode(graph, sym, id);
-            graph.Nodes[id].IsEntryPoint = true;
+            var node = graph.Nodes[id];
+            node.IsEntryPoint = true;
+            node.Meta["functionName"] = fnName;
             graph.AddEdge(projectId, id, EdgeKind.EntryPoint);
         }
     }
@@ -165,6 +223,59 @@ public static class EntryPointDetector
         }
 
         return cls.Name.EndsWith("Controller", StringComparison.Ordinal);
+    }
+
+    /// <summary>Returns the template string from the first [Route("…")] attribute found, or null.</summary>
+    private static string? GetFirstRouteTemplate(
+        System.Collections.Immutable.ImmutableArray<AttributeData> attrs)
+    {
+        foreach (var attr in attrs)
+        {
+            if (attr.AttributeClass is null) continue;
+            if (StripSuffix(attr.AttributeClass.Name, "Attribute") != "Route") continue;
+            if (attr.ConstructorArguments.Length > 0 &&
+                attr.ConstructorArguments[0].Value is string t)
+                return t;
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Combines a controller-level and method-level route template into a full path,
+    /// substituting [controller] and [action] tokens and normalising slashes.
+    /// If the method template begins with '/' or '~/' it is treated as absolute
+    /// and the class prefix is discarded.
+    /// </summary>
+    private static string BuildControllerRoute(
+        string? classTemplate, string? methodTemplate,
+        string controllerName, string actionName)
+    {
+        string Sub(string t) => t
+            .Replace("[controller]", controllerName, StringComparison.OrdinalIgnoreCase)
+            .Replace("[action]",     actionName,     StringComparison.OrdinalIgnoreCase);
+
+        // Absolute method template overrides everything
+        if (methodTemplate is not null)
+        {
+            var m = Sub(methodTemplate);
+            if (m.StartsWith('/') || m.StartsWith("~/"))
+                return m.TrimStart('~');
+        }
+
+        var classSegment  = classTemplate  is not null ? Sub(classTemplate).Trim('/')  : null;
+        var methodSegment = methodTemplate is not null ? Sub(methodTemplate).Trim('/') : null;
+
+        return (classSegment, methodSegment) switch
+        {
+            // Class prefix + explicit method template
+            (not null, not null) => $"/{classSegment}/{methodSegment}",
+            // Class prefix only — verb attr had no template, route is just the prefix
+            (not null, null)     => $"/{classSegment}",
+            // No class prefix — method template is the whole route
+            (null,     not null) => $"/{methodSegment}",
+            // No routing attributes at all — fall back to /{ControllerName}/{ActionName}
+            _                    => $"/{controllerName}/{actionName}"
+        };
     }
 
     // Includes parameter types so overloads are distinct, and containing-type

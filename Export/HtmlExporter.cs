@@ -322,13 +322,21 @@ d3.select(canvas).call(zoom);
 // ── Loading overlay ───────────────────────────────────────────────────────────
 const overlay = document.getElementById('loading-overlay');
 
+let _loadingTimer = null;
 function showLoading(nodeCount) {
-  if (nodeCount < 300) { overlay.classList.add('hidden'); return; }
-  document.getElementById('loading-sub').textContent =
-    `${nodeCount.toLocaleString()} nodes – layout in progress`;
-  overlay.classList.remove('hidden');
+  clearTimeout(_loadingTimer);
+  overlay.classList.add('hidden'); // always reset first
+  if (nodeCount < 300) return;
+  // Only reveal after 500 ms — fast simulations finish before then and the
+  // overlay never appears, preventing a distracting flash for small graphs.
+  _loadingTimer = setTimeout(() => {
+    document.getElementById('loading-sub').textContent =
+      `${nodeCount.toLocaleString()} nodes – layout in progress`;
+    overlay.classList.remove('hidden');
+  }, 500);
 }
 function hideLoading() {
+  clearTimeout(_loadingTimer);
   overlay.classList.add('hidden');
 }
 
@@ -344,7 +352,15 @@ function scheduleMainTick() {
   requestAnimationFrame(mainTickFrame);
 }
 function mainTickFrame() {
-  if (!simRunning || !mainSim || frozen) return;
+  if (!simRunning || !mainSim) return;
+  // When frozen, stop the sim immediately and dismiss the overlay rather than
+  // ticking — positions should not change while frozen.
+  if (frozen) {
+    mainSim.stop();
+    simRunning = false;
+    hideLoading();
+    return;
+  }
   const t0 = performance.now();
   while (performance.now() - t0 < 10 && mainSim.alpha() > mainSim.alphaMin()) {
     mainSim.tick();
@@ -592,13 +608,19 @@ function onWorkerMessage({data: msg}) {
     console.warn('Worker reported error:', msg.msg);
     workerOk = false; worker = null; if (simRunning) startMainSim(); return;
   }
-  // Discard all position updates while frozen (stop msg may still be in-flight).
+  if (msg.type !== 'tick' && msg.type !== 'end') return;
+  if (msg.gen !== workerGen) return;
+  if (msg.type === 'end') {
+    // Always process 'end' — even when frozen — so the loading overlay is dismissed.
+    simRunning = false;
+    hideLoading();
+    return;
+  }
+  // 'tick' — discard position updates while frozen (stop msg may be in-flight).
   if (frozen) return;
-  if ((msg.type !== 'tick' && msg.type !== 'end') || msg.gen !== workerGen) return;
   const xy = msg.xy;
   for (let i = 0; i < nodes.length; i++) { nodes[i].x = xy[2*i]; nodes[i].y = xy[2*i+1]; }
   positionsVersion++;
-  if (msg.type === 'end') { simRunning = false; hideLoading(); }
   maybeRebuildLod();
   maybeRebuildTree();
   markDirty();
@@ -781,6 +803,15 @@ function startMainSim(cfg) {
 }
 
 // ── Panel / selection ─────────────────────────────────────────────────────────
+// Fields that are surfaced with dedicated UI — omit from the raw meta table.
+const PROMOTED_META = new Set(['httpMethod','routeTemplate','functionName']);
+
+// HTTP method → pill colour
+const HTTP_COLOR = {
+  GET:'#16a34a', POST:'#2563eb', PUT:'#d97706', DELETE:'#dc2626',
+  PATCH:'#7c3aed', HEAD:'#0891b2', OPTIONS:'#64748b',
+};
+
 function selectNode(id) {
   selectedId = id;
   markDirty();
@@ -790,13 +821,42 @@ function selectNode(id) {
   const outgoing = (edgesFrom[id]||[]).filter(e => e.kind !== 'Contains');
   const incoming = (edgesTo[id]||[]).filter(e => e.kind !== 'Contains');
   const col = COLOR[n.kind] || '#64748b';
+
+  // ── Tag row ──
   let html = `<div>
     <span class="tag" style="background:${col}22;color:${col};border:1px solid ${col}55">${n.kind}</span>
     ${n.isEntryPoint ? '<span class="tag" style="background:#78350f;color:#fcd34d">⚡ Entry Point</span>' : ''}
-  </div><table>`;
+  </div>`;
+
+  // ── Route banner ──
+  const route  = n.meta?.routeTemplate;
+  const verb   = n.meta?.httpMethod;
+  const fnName = n.meta?.functionName;
+  if (route || verb || fnName) {
+    html += `<div style="margin:8px 0 4px;display:flex;align-items:center;gap:6px;flex-wrap:wrap">`;
+    if (verb) {
+      const vc = HTTP_COLOR[verb] || '#64748b';
+      html += `<span style="background:${vc};color:#fff;font-size:11px;font-weight:700;`+
+              `padding:3px 8px;border-radius:4px;letter-spacing:.05em">${escHtml(verb)}</span>`;
+    }
+    if (route) {
+      html += `<code style="background:#1e293b;color:#e2e8f0;font-size:12px;padding:3px 8px;`+
+              `border-radius:4px;word-break:break-all">${escHtml(route)}</code>`;
+    }
+    if (fnName) {
+      html += `<span style="background:#1e293b;color:#e2e8f0;font-size:12px;padding:3px 8px;`+
+              `border-radius:4px">ƒ ${escHtml(fnName)}</span>`;
+    }
+    html += `</div>`;
+  }
+
+  // ── Meta table (skip promoted fields) ──
+  html += `<table>`;
   html += `<tr><td>ID</td><td style="word-break:break-all;font-size:11px;color:#64748b">${escHtml(id)}</td></tr>`;
-  Object.entries(n.meta||{}).forEach(([k,v]) =>
-    html += `<tr><td>${escHtml(k)}</td><td style="word-break:break-all">${escHtml(v)}</td></tr>`);
+  Object.entries(n.meta||{}).forEach(([k,v]) => {
+    if (PROMOTED_META.has(k)) return;
+    html += `<tr><td>${escHtml(k)}</td><td style="word-break:break-all">${escHtml(v)}</td></tr>`;
+  });
   html += `</table>`;
   const renderNb = (list, label, idKey) => {
     if (!list.length) return '';
