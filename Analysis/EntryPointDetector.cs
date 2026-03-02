@@ -50,6 +50,22 @@ public static class EntryPointDetector
             graph.AddEdge(projectId, id, EdgeKind.EntryPoint);
         }
 
+        // ── Top-level statements (C# 9+ Program.cs with no explicit Main) ───
+        // The compiler synthesises a <Main>$ method; GetEntryPoint() resolves it.
+        if (root.ChildNodes().OfType<GlobalStatementSyntax>().Any())
+        {
+            var entrySymbol = model.Compilation.GetEntryPoint(default);
+            if (entrySymbol is not null)
+            {
+                var id = SymbolId(entrySymbol);
+                EnsureMethodNode(graph, entrySymbol, id);
+                graph.Nodes[id].IsEntryPoint = true;
+                graph.Nodes[id].Label = "<top-level program>";
+                graph.AddEdge(projectId, id, EdgeKind.Contains);   // places it in the hierarchy
+                graph.AddEdge(projectId, id, EdgeKind.EntryPoint);
+            }
+        }
+
         // ── Controller action methods ────────────────────────────────────────
         foreach (var cls in root.DescendantNodes().OfType<ClassDeclarationSyntax>())
         {
@@ -301,7 +317,7 @@ public static class EntryPointDetector
     /// </summary>
     internal static string SymbolId(ISymbol sym)
     {
-        if (sym is IMethodSymbol or IPropertySymbol)
+        if (sym is IMethodSymbol or IPropertySymbol or IFieldSymbol)
         {
             var fq  = sym.ToDisplayString(MemberIdFormat);
             var asm = sym.ContainingAssembly?.Name;
@@ -325,6 +341,28 @@ public static class EntryPointDetector
             node.Meta["fullName"] = sym.ToDisplayString();
             node.Meta["returnType"] = sym.ReturnType.ToDisplayString();
         }
+    }
+
+    /// <summary>
+    /// Ensures an external (non-solution) type node exists in the graph.
+    /// Uses the correct NodeKind (Interface, Enum, Struct, or ExternalType).
+    /// </summary>
+    internal static void EnsureExternalTypeNode(GraphModel graph, INamedTypeSymbol sym, string id)
+    {
+        if (graph.HasNode(id)) return;
+        var kind = sym.TypeKind switch
+        {
+            TypeKind.Interface => NodeKind.Interface,
+            TypeKind.Enum      => NodeKind.Enum,
+            TypeKind.Struct    => NodeKind.Struct,
+            _                  => NodeKind.ExternalType   // Gap C: genuine unknown external class
+        };
+        graph.AddNode(id, sym.Name, kind, meta: new()
+        {
+            ["isExternal"]   = "true",
+            ["fullName"]     = sym.ToDisplayString(),
+            ["assemblyName"] = sym.ContainingAssembly?.Name ?? ""
+        });
     }
 
     private static string StripSuffix(string name, string suffix) =>

@@ -24,5 +24,8 @@ public enum EdgeKind
     EntryPoint,
 
     /// <summary>Method reads or writes a property.</summary>
-    Accesses
+    Accesses,
+
+    /// <summary>Type or method is decorated with an attribute class.</summary>
+    UsesAttribute
 }

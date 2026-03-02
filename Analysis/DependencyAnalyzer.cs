@@ -69,7 +69,7 @@ public static class DependencyAnalyzer
                 sym.BaseType.SpecialType != SpecialType.System_Object)
             {
                 var baseId = EntryPointDetector.SymbolId(sym.BaseType);
-                EnsureExternalTypeNode(graph, sym.BaseType, baseId);
+                EntryPointDetector.EnsureExternalTypeNode(graph, sym.BaseType, baseId);
                 graph.AddEdge(typeId, baseId, EdgeKind.Inherits);
             }
 
@@ -77,21 +77,31 @@ public static class DependencyAnalyzer
             foreach (var iface in sym.Interfaces)
             {
                 var ifaceId = EntryPointDetector.SymbolId(iface);
-                EnsureExternalTypeNode(graph, iface, ifaceId);
+                EntryPointDetector.EnsureExternalTypeNode(graph, iface, ifaceId);
                 graph.AddEdge(typeId, ifaceId, EdgeKind.Implements);
             }
 
-            // Register member methods (so call graph can find them later)
+            // Register member methods, properties, and fields
             foreach (var member in sym.GetMembers())
             {
                 if (member is IMethodSymbol ms &&
                     ms.MethodKind is MethodKind.Ordinary or
                                      MethodKind.Constructor or
-                                     MethodKind.UserDefinedOperator)
+                                     MethodKind.UserDefinedOperator or
+                                     MethodKind.StaticConstructor or   // Gap D
+                                     MethodKind.Destructor)            // Gap D
                 {
                     var methodId = EntryPointDetector.SymbolId(ms);
                     EntryPointDetector.EnsureMethodNode(graph, ms, methodId);
                     graph.AddEdge(typeId, methodId, EdgeKind.Contains);
+                    // Gap F: attribute usage on the method
+                    foreach (var attr in ms.GetAttributes())
+                    {
+                        if (attr.AttributeClass is null) continue;
+                        var attrId = EntryPointDetector.SymbolId(attr.AttributeClass);
+                        EntryPointDetector.EnsureExternalTypeNode(graph, attr.AttributeClass, attrId);
+                        graph.AddEdge(methodId, attrId, EdgeKind.UsesAttribute);
+                    }
                 }
                 else if (member is IPropertySymbol ps)
                 {
@@ -109,16 +119,39 @@ public static class DependencyAnalyzer
                         propNode.Meta["type"]     = ps.Type.ToDisplayString();
                     }
                     graph.AddEdge(typeId, propId, EdgeKind.Contains);
+                    // Gap F: attribute usage on the property
+                    foreach (var attr in ps.GetAttributes())
+                    {
+                        if (attr.AttributeClass is null) continue;
+                        var attrId = EntryPointDetector.SymbolId(attr.AttributeClass);
+                        EntryPointDetector.EnsureExternalTypeNode(graph, attr.AttributeClass, attrId);
+                        graph.AddEdge(propId, attrId, EdgeKind.UsesAttribute);
+                    }
                 }
+                // Gap A: register fields (skip auto-generated backing fields and enum members)
+                else if (member is IFieldSymbol fs &&
+                         !fs.IsImplicitlyDeclared &&
+                         sym.TypeKind != TypeKind.Enum)
+                {
+                    var fieldId = EntryPointDetector.SymbolId(fs);
+                    graph.AddNode(fieldId, fs.Name, NodeKind.Field, meta: new()
+                    {
+                        ["fullName"] = fs.ToDisplayString(),
+                        ["type"]     = fs.Type.ToDisplayString()
+                    });
+                    graph.AddEdge(typeId, fieldId, EdgeKind.Contains);
+                }
+            }
+
+            // Gap F: emit UsesAttribute edges for every attribute on the type
+            foreach (var attr in sym.GetAttributes())
+            {
+                if (attr.AttributeClass is null) continue;
+                var attrId = EntryPointDetector.SymbolId(attr.AttributeClass);
+                EntryPointDetector.EnsureExternalTypeNode(graph, attr.AttributeClass, attrId);
+                graph.AddEdge(typeId, attrId, EdgeKind.UsesAttribute);
             }
         }
     }
 
-    private static void EnsureExternalTypeNode(GraphModel graph, INamedTypeSymbol sym, string id)
-    {
-        if (graph.HasNode(id)) return;
-        graph.AddNode(id, sym.Name,
-            sym.TypeKind == TypeKind.Interface ? NodeKind.Interface : NodeKind.Class,
-            meta: new() { ["isExternal"] = "true", ["fullName"] = sym.ToDisplayString() });
-    }
 }

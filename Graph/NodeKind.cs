@@ -11,6 +11,7 @@ public enum NodeKind
     Enum,
     Method,
     Property,
+    Field,
     NuGetPackage,
     ExternalType
 }
