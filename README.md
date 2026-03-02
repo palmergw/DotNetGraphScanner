@@ -8,7 +8,7 @@ Also supports **cross-API dependency mapping**: scan individual APIs, push their
 
 ## Interactive Preview
 
-▶ **[Open cross-API map (FooApi ↔ BarApi)](https://htmlpreview.github.io/?https://github.com/palmergw/DotNetGraphScanner/blob/main/sample-output/FooApi-BarApi.cross.html)**
+▶ **[Open cross-API map (FooApi ↔ BarApi)](https://htmlpreview.github.io/?https://github.com/palmergw/DotNetGraphScanner/blob/master/sample-output/FooApi-BarApi.cross.html)**
 
 Static snapshot of the FooApi ↔ BarApi dependency map generated from the bundled sample projects. Shows entry points, outbound cross-API calls, and BFS-reachability impact analysis. Click any box to explore.
 
