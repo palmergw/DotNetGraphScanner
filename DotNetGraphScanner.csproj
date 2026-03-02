@@ -10,6 +10,13 @@
     <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
   </PropertyGroup>
 
+  <!-- Exclude sample projects — they are inputs to the scanner, not part of it -->
+  <ItemGroup>
+    <Compile Remove="samples/**/*.cs" />
+    <EmbeddedResource Remove="samples/**" />
+    <None Remove="samples/**" />
+  </ItemGroup>
+
   <ItemGroup>
     <!-- Roslyn workspaces + MSBuild loader -->
     <PackageReference Include="Microsoft.Build.Locator"                            Version="1.7.8" />
@@ -23,6 +30,9 @@
 
     <!-- JSON output -->
     <PackageReference Include="System.Text.Json"                                   Version="8.0.5" />
+
+    <!-- Neo4j driver for push/live-view features -->
+    <PackageReference Include="Neo4j.Driver"                                       Version="5.26.0" />
   </ItemGroup>
 
 </Project>

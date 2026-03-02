@@ -1,0 +1,484 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>FooApi-BarApi.cross – Cross-API Map</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: 'Segoe UI', system-ui, sans-serif; background: #0d1117; color: #c9d1d9; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+
+/* ── Header ──────────────────────────────────────────────────── */
+#header { padding: 14px 24px; border-bottom: 1px solid #21262d; display: flex; align-items: center; gap: 16px; flex-shrink: 0; }
+#header h1 { font-size: 15px; font-weight: 700; color: #f0f6fc; white-space: nowrap; }
+#header .subtitle { font-size: 12px; color: #8b949e; }
+#header .legend { display: flex; align-items: center; gap: 16px; margin-left: auto; font-size: 12px; }
+#header .legend-item { display: flex; align-items: center; gap: 6px; }
+.pill-ep-sample  { width: 12px; height: 12px; border-radius: 3px; background: #0f291e; border: 1px solid #238636; }
+.pill-out-sample { width: 12px; height: 12px; border-radius: 3px; background: #2d1c00; border: 1px solid #d29922; }
+
+/* ── Main canvas ─────────────────────────────────────────────── */
+#canvas-wrap { flex: 1; overflow: auto; position: relative; padding: 40px; }
+#canvas { display: block; }
+
+/* ── API card ────────────────────────────────────────────────── */
+.api-card { fill: #161b22; stroke: #30363d; stroke-width: 1; rx: 10; ry: 10; }
+.api-card.dim { opacity: 0.35; }
+.api-name { fill: #f0f6fc; font-size: 14px; font-weight: 700; user-select: none; }
+.api-name.dim { opacity: 0.35; }
+.col-label { fill: #8b949e; font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; user-select: none; }
+
+/* ── Pills (entry points) ────────────────────────────────────── */
+.pill-ep { fill: #0f291e; stroke: #238636; stroke-width: 1; rx: 5; cursor: pointer; transition: fill .15s; }
+.pill-ep:hover { fill: #1a4731; }
+.pill-ep.active  { fill: #1a4731; stroke: #3fb950; stroke-width: 2; }
+.pill-ep.dim     { opacity: 0.25; }
+.pill-ep-text { fill: #3fb950; font-size: 11px; font-weight: 600; pointer-events: none; user-select: none; }
+.pill-ep-text.dim { opacity: 0.25; }
+.pill-ep-badge { fill: #238636; rx: 3; pointer-events: none; }
+.pill-ep-badge.dim { opacity: 0.25; }
+.pill-ep-badge-text { fill: #f0f6fc; font-size: 9px; font-weight: 700; pointer-events: none; user-select: none; }
+.pill-ep-badge-text.dim { opacity: 0.25; }
+
+/* ── Pills (outbound calls) ──────────────────────────────────── */
+.pill-out { fill: #2d1c00; stroke: #d29922; stroke-width: 1; rx: 5; cursor: pointer; transition: fill .15s; }
+.pill-out:hover { fill: #3d2600; }
+.pill-out.active { fill: #3d2600; stroke: #f97316; stroke-width: 2; }
+.pill-out.dim    { opacity: 0.25; }
+.pill-out-text { fill: #e3b341; font-size: 11px; font-weight: 600; pointer-events: none; user-select: none; }
+.pill-out-text.dim { opacity: 0.25; }
+.pill-out-arrow { fill: #d29922; pointer-events: none; }
+.pill-out-arrow.dim { opacity: 0.25; }
+
+/* ── Connector lines ─────────────────────────────────────────── */
+.connector { fill: none; stroke: #30363d; stroke-width: 1.5; opacity: 0.9; stroke-dasharray: 5 3; }
+.connector.active { stroke: #58a6ff; stroke-width: 2; opacity: 1; stroke-dasharray: none; }
+.connector.dim    { stroke: #30363d; opacity: 0.15; stroke-dasharray: 5 3; }
+.connector-dot { fill: #30363d; }
+.connector-dot.active { fill: #58a6ff; }
+.connector-dot.dim { opacity: 0.15; }
+
+/* ── Divider line inside card ────────────────────────────────── */
+.card-divider { stroke: #21262d; stroke-width: 1; }
+
+/* ── Impact panel ────────────────────────────────────────────── */
+#impact-panel { position: fixed; bottom: 0; left: 0; right: 0; background: #161b22; border-top: 1px solid #30363d; padding: 14px 24px; transition: transform .2s; transform: translateY(100%); max-height: 220px; overflow-y: auto; z-index: 100; }
+#impact-panel.visible { transform: translateY(0); }
+#impact-panel h2 { font-size: 13px; font-weight: 700; margin-bottom: 10px; color: #f0f6fc; }
+#impact-panel .close-btn { position: absolute; top: 14px; right: 24px; background: none; border: none; color: #8b949e; cursor: pointer; font-size: 18px; line-height: 1; }
+#impact-panel .close-btn:hover { color: #f0f6fc; }
+.impact-section { margin-bottom: 10px; }
+.impact-section h3 { font-size: 11px; font-weight: 600; color: #8b949e; text-transform: uppercase; letter-spacing: .06em; margin-bottom: 6px; }
+.impact-tag { display: inline-block; margin: 2px 4px; padding: 3px 10px; border-radius: 12px; font-size: 11px; font-weight: 600; }
+.impact-tag.ep  { background: #0f291e; border: 1px solid #238636; color: #3fb950; }
+.impact-tag.out { background: #2d1c00; border: 1px solid #d29922; color: #e3b341; }
+.impact-empty { color: #8b949e; font-size: 12px; font-style: italic; }
+</style>
+</head>
+<body>
+
+<div id="header">
+  <h1>FooApi-BarApi.cross – Cross-API Dependency Map</h1>
+  <span class="subtitle">Click an entry point or outbound call to explore impact</span>
+  <div class="legend">
+    <div class="legend-item"><div class="pill-ep-sample"></div> Entry point (inbound)</div>
+    <div class="legend-item"><div class="pill-out-sample"></div> Outbound API call</div>
+  </div>
+</div>
+
+<div id="canvas-wrap">
+  <svg id="canvas" xmlns="http://www.w3.org/2000/svg"></svg>
+</div>
+
+<div id="impact-panel">
+  <button class="close-btn" onclick="closePanel()">✕</button>
+  <h2 id="panel-title"></h2>
+  <div id="panel-body"></div>
+</div>
+
+<script>
+const DATA = {"title":"FooApi-BarApi.cross","apis":[{"name":"BarApi","entryPoints":[{"nodeId":"BarApi#global::BarApi.Controllers.InventoryController.GetInventory(string)","httpMethod":"GET","route":"/Inventory","label":"GET /Inventory"},{"nodeId":"BarApi#global::BarApi.Controllers.InventoryController.ReserveInventory(global::BarApi.Models.ReserveRequest)","httpMethod":"POST","route":"/Inventory/reserve","label":"POST /Inventory/reserve"},{"nodeId":"BarApi#global::BarApi.Controllers.NotificationsController.SendNotification(global::BarApi.Models.SendNotificationRequest)","httpMethod":"POST","route":"/Notifications","label":"POST /Notifications"},{"nodeId":"BarApi#global::BarApi.Controllers.NotificationsController.GetNotification(string)","httpMethod":"GET","route":"/Notifications/{id}","label":"GET /Notifications/{id}"},{"nodeId":"BarApi#global::BarApi.Controllers.StatusController.GetStatus()","httpMethod":"GET","route":"/Status","label":"GET /Status"}],"outboundCalls":[{"nodeId":"BarApi#global::BarApi.Clients.IFooApiClient.GetOrdersAsync()","targetApi":"FooApi","targetRoute":"GET /orders","label":"BarApi \u2192 FooApi: GET /orders"},{"nodeId":"BarApi#global::BarApi.Clients.IFooApiClient.GetOrderAsync(int)","targetApi":"FooApi","targetRoute":"GET /orders/{id}","label":"BarApi \u2192 FooApi: GET /orders/{id}"},{"nodeId":"BarApi#global::BarApi.Clients.IFooApiClient.GetHealthAsync()","targetApi":"FooApi","targetRoute":"GET /health","label":"BarApi \u2192 FooApi: GET /health"}]},{"name":"FooApi","entryPoints":[{"nodeId":"FooApi#global::FooApi.Controllers.HealthController.GetHealth()","httpMethod":"GET","route":"/Health","label":"GET /Health"},{"nodeId":"FooApi#global::FooApi.Controllers.OrdersController.GetOrders()","httpMethod":"GET","route":"/Orders","label":"GET /Orders"},{"nodeId":"FooApi#global::FooApi.Controllers.OrdersController.GetOrder(int)","httpMethod":"GET","route":"/Orders/{id:int}","label":"GET /Orders/{id:int}"},{"nodeId":"FooApi#global::FooApi.Controllers.OrdersController.CreateOrder(global::FooApi.Models.CreateOrderRequest)","httpMethod":"POST","route":"/Orders","label":"POST /Orders"},{"nodeId":"FooApi#global::FooApi.Controllers.OrdersController.CancelOrder(int)","httpMethod":"DELETE","route":"/Orders/{id:int}","label":"DELETE /Orders/{id:int}"}],"outboundCalls":[{"nodeId":"FooApi#global::FooApi.Clients.IBarApiClient.GetInventoryAsync(string)","targetApi":"BarApi","targetRoute":"GET /inventory","label":"FooApi \u2192 BarApi: GET /inventory"},{"nodeId":"FooApi#global::FooApi.Clients.IBarApiClient.ReserveInventoryAsync(string, int)","targetApi":"BarApi","targetRoute":"POST /inventory/reserve","label":"FooApi \u2192 BarApi: POST /inventory/reserve"},{"nodeId":"FooApi#global::FooApi.Clients.IBarApiClient.SendNotificationAsync(string, string)","targetApi":"BarApi","targetRoute":"POST /notifications","label":"FooApi \u2192 BarApi: POST /notifications"},{"nodeId":"FooApi#global::FooApi.Clients.IBarApiClient.GetStatusAsync()","targetApi":"BarApi","targetRoute":"GET /status","label":"FooApi \u2192 BarApi: GET /status"}]}],"impacts":[{"entrypointNodeId":"FooApi#global::FooApi.Controllers.HealthController.GetHealth()","callNodeIds":["FooApi#global::FooApi.Clients.IBarApiClient.GetStatusAsync()"]},{"entrypointNodeId":"FooApi#global::FooApi.Controllers.OrdersController.GetOrders()","callNodeIds":["FooApi#global::FooApi.Clients.IBarApiClient.GetInventoryAsync(string)"]},{"entrypointNodeId":"FooApi#global::FooApi.Controllers.OrdersController.CreateOrder(global::FooApi.Models.CreateOrderRequest)","callNodeIds":["FooApi#global::FooApi.Clients.IBarApiClient.ReserveInventoryAsync(string, int)","FooApi#global::FooApi.Clients.IBarApiClient.SendNotificationAsync(string, string)"]},{"entrypointNodeId":"FooApi#global::FooApi.Controllers.OrdersController.CancelOrder(int)","callNodeIds":["FooApi#global::FooApi.Clients.IBarApiClient.SendNotificationAsync(string, string)"]},{"entrypointNodeId":"BarApi#global::BarApi.Controllers.InventoryController.GetInventory(string)","callNodeIds":["BarApi#global::BarApi.Clients.IFooApiClient.GetOrdersAsync()"]},{"entrypointNodeId":"BarApi#global::BarApi.Controllers.StatusController.GetStatus()","callNodeIds":["BarApi#global::BarApi.Clients.IFooApiClient.GetHealthAsync()"]}],"connections":[{"outboundCallNodeId":"FooApi#global::FooApi.Clients.IBarApiClient.GetInventoryAsync(string)","ownerApi":"FooApi","targetApi":"BarApi","targetRoute":"GET /inventory","matchedEntrypointNodeId":"BarApi#global::BarApi.Controllers.InventoryController.GetInventory(string)"},{"outboundCallNodeId":"FooApi#global::FooApi.Clients.IBarApiClient.ReserveInventoryAsync(string, int)","ownerApi":"FooApi","targetApi":"BarApi","targetRoute":"POST /inventory/reserve","matchedEntrypointNodeId":"BarApi#global::BarApi.Controllers.InventoryController.ReserveInventory(global::BarApi.Models.ReserveRequest)"},{"outboundCallNodeId":"FooApi#global::FooApi.Clients.IBarApiClient.SendNotificationAsync(string, string)","ownerApi":"FooApi","targetApi":"BarApi","targetRoute":"POST /notifications","matchedEntrypointNodeId":"BarApi#global::BarApi.Controllers.NotificationsController.SendNotification(global::BarApi.Models.SendNotificationRequest)"},{"outboundCallNodeId":"FooApi#global::FooApi.Clients.IBarApiClient.GetStatusAsync()","ownerApi":"FooApi","targetApi":"BarApi","targetRoute":"GET /status","matchedEntrypointNodeId":"BarApi#global::BarApi.Controllers.StatusController.GetStatus()"},{"outboundCallNodeId":"BarApi#global::BarApi.Clients.IFooApiClient.GetOrdersAsync()","ownerApi":"BarApi","targetApi":"FooApi","targetRoute":"GET /orders","matchedEntrypointNodeId":"FooApi#global::FooApi.Controllers.OrdersController.GetOrders()"},{"outboundCallNodeId":"BarApi#global::BarApi.Clients.IFooApiClient.GetOrderAsync(int)","ownerApi":"BarApi","targetApi":"FooApi","targetRoute":"GET /orders/{id}","matchedEntrypointNodeId":"FooApi#global::FooApi.Controllers.OrdersController.GetOrder(int)"},{"outboundCallNodeId":"BarApi#global::BarApi.Clients.IFooApiClient.GetHealthAsync()","ownerApi":"BarApi","targetApi":"FooApi","targetRoute":"GET /health","matchedEntrypointNodeId":"FooApi#global::FooApi.Controllers.HealthController.GetHealth()"}]};
+
+// ── Layout constants ────────────────────────────────────────────────────────
+const BOX_W         = 360;
+const BOX_H_HEADER  = 52;
+const PILL_H        = 28;
+const PILL_ROW      = 38;
+const BOX_PAD       = 18;
+const COL_GAP       = 12;
+const API_GAP       = 180;   // space between boxes for bezier curves
+const MARGIN_X      = 60;
+const MARGIN_Y      = 50;
+const CARD_RADIUS   = 10;
+const BADGE_W       = 38;
+
+// ── Build quick‑lookup maps ─────────────────────────────────────────────────
+const epById           = {};   // nodeId → EpDto
+const outById          = {};   // nodeId → OutDto
+const epToCallNodeIds  = {};   // entrypointNodeId → [callNodeId, …]
+const callToEpNodeIds  = {};   // callNodeId → [entrypointNodeId, …]
+const outConnTo        = {};   // outboundCallNodeId → matchedEntrypointNodeId | null
+const epConnFrom       = {};   // matchedEntrypointNodeId → [outboundCallNodeId, …]
+
+DATA.apis.forEach(api => {
+  api.entryPoints.forEach(ep  => { epById[ep.nodeId]  = { ...ep, api: api.name }; });
+  api.outboundCalls.forEach(o => { outById[o.nodeId]  = { ...o, api: api.name }; });
+});
+
+DATA.impacts.forEach(imp => {
+  epToCallNodeIds[imp.entrypointNodeId] = imp.callNodeIds;
+  imp.callNodeIds.forEach(cn => {
+    (callToEpNodeIds[cn] = callToEpNodeIds[cn] || []).push(imp.entrypointNodeId);
+  });
+});
+
+DATA.connections.forEach(c => {
+  outConnTo[c.outboundCallNodeId] = c.matchedEntrypointNodeId || null;
+  if (c.matchedEntrypointNodeId) {
+    (epConnFrom[c.matchedEntrypointNodeId] = epConnFrom[c.matchedEntrypointNodeId] || [])
+      .push(c.outboundCallNodeId);
+  }
+});
+
+// ── Compute layout ──────────────────────────────────────────────────────────
+function boxHeight(api) {
+  const rows = Math.max(api.entryPoints.length, api.outboundCalls.length, 1);
+  return BOX_H_HEADER + BOX_PAD + rows * PILL_ROW + BOX_PAD;
+}
+
+const colW    = (BOX_W - COL_GAP * 3) / 2;   // width of each column's pill area
+const layout  = {};   // apiName → { x, y, w, h, epPills: [{nodeId, x, y, w, h}], outPills: [...] }
+
+let curX = MARGIN_X;
+let maxH = 0;
+DATA.apis.forEach(api => {
+  const h  = boxHeight(api);
+  maxH     = Math.max(maxH, h);
+  const bx = curX;
+  const by = MARGIN_Y;
+
+  const epPills  = api.entryPoints.map((ep, i) => ({
+    nodeId: ep.nodeId,
+    x: bx + BOX_PAD,
+    y: by + BOX_H_HEADER + BOX_PAD + i * PILL_ROW,
+    w: colW,
+    h: PILL_H
+  }));
+
+  const outPills = api.outboundCalls.map((o, i) => ({
+    nodeId: o.nodeId,
+    x: bx + BOX_PAD + colW + COL_GAP,
+    y: by + BOX_H_HEADER + BOX_PAD + i * PILL_ROW,
+    w: colW,
+    h: PILL_H
+  }));
+
+  layout[api.name] = { x: bx, y: by, w: BOX_W, h, epPills, outPills };
+  curX += BOX_W + API_GAP;
+});
+
+const svgW = curX - API_GAP + MARGIN_X;
+const svgH = maxH + MARGIN_Y * 2;
+
+// Build pill position lookups
+const pillPos = {};   // nodeId → { cx, cy, side: 'left'|'right' }
+DATA.apis.forEach(api => {
+  const lay = layout[api.name];
+  lay.epPills.forEach(p  => { pillPos[p.nodeId] = { cx: p.x,           cy: p.y + p.h / 2, side: 'left',  ...p }; });
+  lay.outPills.forEach(p => { pillPos[p.nodeId] = { cx: p.x + p.w,     cy: p.y + p.h / 2, side: 'right', ...p }; });
+});
+
+// ── Render helpers ──────────────────────────────────────────────────────────
+const SVG_NS = 'http://www.w3.org/2000/svg';
+
+function el(tag, attrs, text) {
+  const e = document.createElementNS(SVG_NS, tag);
+  Object.entries(attrs || {}).forEach(([k, v]) => e.setAttribute(k, v));
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+
+function truncate(str, maxW, charPx = 6.5) {
+  const maxChars = Math.floor(maxW / charPx);
+  return str.length > maxChars ? str.slice(0, maxChars - 1) + '…' : str;
+}
+
+// ── Draw ────────────────────────────────────────────────────────────────────
+const svg = document.getElementById('canvas');
+svg.setAttribute('width',  svgW);
+svg.setAttribute('height', svgH);
+svg.setAttribute('viewBox', `0 0 ${svgW} ${svgH}`);
+
+// Layer groups (back to front)
+const connLayer = el('g', { id: 'conn-layer' });
+const cardLayer = el('g', { id: 'card-layer' });
+const pillLayer = el('g', { id: 'pill-layer' });
+svg.appendChild(connLayer);
+svg.appendChild(cardLayer);
+svg.appendChild(pillLayer);
+
+// Draw each API card
+DATA.apis.forEach(api => {
+  const lay   = layout[api.name];
+  const g     = el('g', { 'data-api': api.name });
+
+  // Card background
+  const card  = el('rect', { x: lay.x, y: lay.y, width: lay.w, height: lay.h,
+    rx: CARD_RADIUS, class: 'api-card', 'data-api': api.name });
+  g.appendChild(card);
+
+  // API name
+  const nameY = lay.y + 30;
+  g.appendChild(el('text', { x: lay.x + BOX_W / 2, y: nameY,
+    class: 'api-name', 'text-anchor': 'middle', 'data-api': api.name }, api.name));
+
+  // Column divider
+  const divX = lay.x + BOX_PAD + colW + COL_GAP / 2;
+  g.appendChild(el('line', { x1: divX, y1: lay.y + BOX_H_HEADER, x2: divX, y2: lay.y + lay.h,
+    class: 'card-divider' }));
+
+  // Column labels
+  const colLabelY = lay.y + BOX_H_HEADER - 6;
+  g.appendChild(el('text', { x: lay.x + BOX_PAD + colW / 2, y: colLabelY,
+    class: 'col-label', 'text-anchor': 'middle' }, 'Entry Points'));
+  g.appendChild(el('text', { x: lay.x + BOX_PAD + colW + COL_GAP + colW / 2, y: colLabelY,
+    class: 'col-label', 'text-anchor': 'middle' }, 'Outbound Calls'));
+
+  cardLayer.appendChild(g);
+
+  // Entry-point pills
+  lay.epPills.forEach((p, i) => {
+    const ep  = api.entryPoints[i];
+    const pg  = el('g', { 'data-ep': ep.nodeId, class: 'pill-ep-group',
+      style: 'cursor:pointer', tabindex: 0 });
+
+    pg.appendChild(el('rect', { x: p.x, y: p.y, width: p.w, height: p.h,
+      class: 'pill-ep', 'data-ep': ep.nodeId }));
+
+    // HTTP verb badge
+    const vw = BADGE_W;
+    pg.appendChild(el('rect', { x: p.x + 4, y: p.y + 4, width: vw, height: p.h - 8,
+      class: 'pill-ep-badge', 'data-ep': ep.nodeId }));
+    pg.appendChild(el('text', { x: p.x + 4 + vw / 2, y: p.y + p.h / 2 + 1,
+      class: 'pill-ep-badge-text', 'text-anchor': 'middle', 'dominant-baseline': 'middle',
+      'data-ep': ep.nodeId }, ep.httpMethod));
+
+    // Route text
+    const routeLabel = truncate(ep.route, p.w - vw - 20);
+    pg.appendChild(el('text', { x: p.x + vw + 10, y: p.y + p.h / 2 + 1,
+      class: 'pill-ep-text', 'dominant-baseline': 'middle', 'data-ep': ep.nodeId }, routeLabel));
+
+    pg.addEventListener('click', () => onEpClick(ep.nodeId));
+    pillLayer.appendChild(pg);
+  });
+
+  // Outbound-call pills
+  lay.outPills.forEach((p, i) => {
+    const out = api.outboundCalls[i];
+    const pg  = el('g', { 'data-out': out.nodeId, class: 'pill-out-group',
+      style: 'cursor:pointer', tabindex: 0 });
+
+    pg.appendChild(el('rect', { x: p.x, y: p.y, width: p.w, height: p.h,
+      class: 'pill-out', 'data-out': out.nodeId }));
+
+    // Arrow indicator at right edge
+    const ax = p.x + p.w - 10;
+    const ay = p.y + p.h / 2;
+    pg.appendChild(el('polygon', { points: `${ax-5},${ay-5} ${ax+3},${ay} ${ax-5},${ay+5}`,
+      class: 'pill-out-arrow', 'data-out': out.nodeId }));
+
+    // Label text (target api + route)
+    const outLabel = truncate(`${out.targetApi}: ${out.targetRoute}`, p.w - 24);
+    pg.appendChild(el('text', { x: p.x + 8, y: p.y + p.h / 2 + 1,
+      class: 'pill-out-text', 'dominant-baseline': 'middle', 'data-out': out.nodeId }, outLabel));
+
+    pg.addEventListener('click', () => onOutClick(out.nodeId));
+    pillLayer.appendChild(pg);
+  });
+});
+
+// ── Draw connector lines ────────────────────────────────────────────────────
+DATA.connections.forEach(conn => {
+  if (!conn.matchedEntrypointNodeId) return;
+  const srcPos = pillPos[conn.outboundCallNodeId];
+  const tgtPos = pillPos[conn.matchedEntrypointNodeId];
+  if (!srcPos || !tgtPos) return;
+
+  const x1 = srcPos.x + srcPos.w;   // right edge of outbound pill
+  const y1 = srcPos.cy;
+  const x2 = tgtPos.x;              // left edge of entry point pill
+  const y2 = tgtPos.cy;
+
+  let d;
+  if (x2 >= x1) {
+    // Forward connection (left → right): simple cubic bezier
+    const cpDist = Math.max(60, (x2 - x1) * 0.45);
+    d = `M ${x1} ${y1} C ${x1 + cpDist} ${y1}, ${x2 - cpDist} ${y2}, ${x2} ${y2}`;
+  } else {
+    // Back connection (right → left): arc around the bottom of the cards
+    const arcY = Math.max(
+      ...Object.values(layout).map(l => l.y + l.h)
+    ) + 40;
+    const cpOut = 80;
+    d = `M ${x1} ${y1} C ${x1 + cpOut} ${y1}, ${x1 + cpOut} ${arcY},`
+      + ` ${(x1 + x2) / 2} ${arcY}`
+      + ` S ${x2 - cpOut} ${arcY}, ${x2 - cpOut} ${y2}`
+      + ` S ${x2} ${y2}, ${x2} ${y2}`;
+  }
+
+  const path = el('path', { d, class: 'connector',
+    'data-conn-out': conn.outboundCallNodeId,
+    'data-conn-ep':  conn.matchedEntrypointNodeId });
+  connLayer.appendChild(path);
+
+  // Terminal dots
+  connLayer.appendChild(el('circle', { cx: x1, cy: y1, r: 3.5, class: 'connector-dot',
+    'data-conn-out': conn.outboundCallNodeId, 'data-conn-ep': conn.matchedEntrypointNodeId }));
+  connLayer.appendChild(el('circle', { cx: x2, cy: y2, r: 3.5, class: 'connector-dot',
+    'data-conn-out': conn.outboundCallNodeId, 'data-conn-ep': conn.matchedEntrypointNodeId }));
+});
+
+// ── Interaction ─────────────────────────────────────────────────────────────
+let activeNodeId = null;
+
+function clearHighlights() {
+  activeNodeId = null;
+  svg.querySelectorAll('.active').forEach(e => e.classList.remove('active'));
+  svg.querySelectorAll('.dim').forEach(e => e.classList.remove('dim'));
+}
+
+function dimAll() {
+  svg.querySelectorAll('.api-card, .api-name, .col-label').forEach(e => e.classList.add('dim'));
+  svg.querySelectorAll('.pill-ep, .pill-ep-text, .pill-ep-badge, .pill-ep-badge-text')
+    .forEach(e => e.classList.add('dim'));
+  svg.querySelectorAll('.pill-out, .pill-out-text, .pill-out-arrow')
+    .forEach(e => e.classList.add('dim'));
+  svg.querySelectorAll('.connector, .connector-dot').forEach(e => e.classList.add('dim'));
+}
+
+function activatePill(selector, nodeId) {
+  svg.querySelectorAll(`[${selector}="${nodeId}"]`).forEach(e => {
+    e.classList.remove('dim');
+    e.classList.add('active');
+  });
+}
+
+function activateConnector(outId, epId) {
+  svg.querySelectorAll(`[data-conn-out="${outId}"][data-conn-ep="${epId}"]`).forEach(e => {
+    e.classList.remove('dim');
+    e.classList.add('active');
+  });
+}
+
+function onEpClick(nodeId) {
+  if (activeNodeId === nodeId) { clearHighlights(); closePanel(); return; }
+  clearHighlights();
+  activeNodeId = nodeId;
+
+  // Dim everything
+  dimAll();
+
+  // Activate the entry point itself
+  activatePill('data-ep', nodeId);
+
+  const reachableCalls = epToCallNodeIds[nodeId] || [];
+  reachableCalls.forEach(callId => {
+    activatePill('data-out', callId);
+    const target = outConnTo[callId];
+    if (target) activateConnector(callId, target);
+  });
+
+  // Show impact panel
+  const ep = epById[nodeId];
+  const calls = reachableCalls.map(id => outById[id]).filter(Boolean);
+  showEpImpactPanel(ep, calls);
+}
+
+function onOutClick(nodeId) {
+  if (activeNodeId === nodeId) { clearHighlights(); closePanel(); return; }
+  clearHighlights();
+  activeNodeId = nodeId;
+
+  dimAll();
+  activatePill('data-out', nodeId);
+
+  const ep = outConnTo[nodeId];
+  if (ep) { activatePill('data-ep', ep); activateConnector(nodeId, ep); }
+
+  const triggeringEps = callToEpNodeIds[nodeId] || [];
+  triggeringEps.forEach(epId => activatePill('data-ep', epId));
+
+  const outInfo = outById[nodeId];
+  const eps = triggeringEps.map(id => epById[id]).filter(Boolean);
+  showOutImpactPanel(outInfo, eps, ep ? epById[ep] : null);
+}
+
+// Clicking on the canvas background resets
+svg.addEventListener('click', e => {
+  if (!e.target.closest('[data-ep], [data-out]')) { clearHighlights(); closePanel(); }
+});
+
+// ── Impact panel ─────────────────────────────────────────────────────────────
+function closePanel() {
+  document.getElementById('impact-panel').classList.remove('visible');
+}
+
+function renderTags(items, cls) {
+  return items.map(t => `<span class="impact-tag ${cls}">${escHtml(t)}</span>`).join('');
+}
+
+function escHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function showEpImpactPanel(ep, calls) {
+  const panel = document.getElementById('impact-panel');
+  document.getElementById('panel-title').textContent
+    = `Impact: ${ep.api}  ·  ${ep.httpMethod} ${ep.route}`;
+
+  let html = '';
+  if (calls.length === 0) {
+    html = `<div class="impact-section"><p class="impact-empty">No outbound API calls detected from this entry point.</p></div>`;
+  } else {
+    const byApi = {};
+    calls.forEach(c => { (byApi[c.targetApi] = byApi[c.targetApi] || []).push(c.targetRoute); });
+    html = Object.entries(byApi).map(([api, routes]) =>
+      `<div class="impact-section">
+        <h3>Calls to ${escHtml(api)}</h3>
+        ${renderTags(routes, 'out')}
+      </div>`
+    ).join('');
+  }
+
+  document.getElementById('panel-body').innerHTML = html;
+  panel.classList.add('visible');
+}
+
+function showOutImpactPanel(out, eps, matchedEp) {
+  const panel = document.getElementById('impact-panel');
+  document.getElementById('panel-title').textContent
+    = `Outbound call: ${out.targetApi}  ·  ${out.targetRoute}`;
+
+  let html = '';
+  if (matchedEp) {
+    html += `<div class="impact-section">
+      <h3>Resolves to</h3>
+      ${renderTags([`${matchedEp.api}: ${matchedEp.httpMethod} ${matchedEp.route}`], 'ep')}
+    </div>`;
+  }
+
+  if (eps.length > 0) {
+    html += `<div class="impact-section">
+      <h3>Triggered by hitting these entry points on ${escHtml(out.api)}</h3>
+      ${renderTags(eps.map(e => `${e.httpMethod} ${e.route}`), 'ep')}
+    </div>`;
+  } else {
+    html += `<div class="impact-section"><p class="impact-empty">Not reachable from any tracked entry point in ${escHtml(out.api)}.</p></div>`;
+  }
+
+  document.getElementById('panel-body').innerHTML = html;
+  panel.classList.add('visible');
+}
+</script>
+</body>
+</html>

@@ -1,6 +1,8 @@
 using System.CommandLine;
 using DotNetGraphScanner.Analysis;
 using DotNetGraphScanner.Export;
+using DotNetGraphScanner.Graph;
+using DotNetGraphScanner.Store;
 
 // ── Must register MSBuild BEFORE any Roslyn types are loaded ─────────────────
 // (done inside SolutionAnalyzer when first invoked)
@@ -53,10 +55,32 @@ var externalOpt = new Option<bool>(
     description: "Include external (non-project) type and method nodes in the HTML.",
     getDefaultValue: () => false);
 
+// ── Neo4j push options (shared by scan + cross-view) ────────────────────────
+var neoUrlOpt  = new Option<string>(
+    aliases: ["--neo4j-url"],
+    description: "Bolt URL of the Neo4j-compatible database.",
+    getDefaultValue: () => "bolt://127.0.0.1:7687");
+
+var neoUserOpt = new Option<string?>(
+    aliases: ["--neo4j-user"],
+    description: "Neo4j username (leave empty for no auth).",
+    getDefaultValue: () => "neo4j");
+
+var neoPassOpt = new Option<string?>(
+    aliases: ["--neo4j-pass"],
+    description: "Neo4j password (leave empty for no auth).",
+    getDefaultValue: () => null);
+
+var pushOpt = new Option<bool>(
+    aliases: ["--push"],
+    description: "Push cross-API metadata to a Neo4j database after scanning.",
+    getDefaultValue: () => false);
+
 var scanCmd = new Command("scan", "Analyze a .NET solution/project and produce graph files.")
 {
     scanInputArg, outputOpt, htmlOpt, jsonOpt, neo4jOpt,
-    noCallsOpt, noDepsOpt, noEntryOpt, externalOpt
+    noCallsOpt, noDepsOpt, noEntryOpt, externalOpt,
+    pushOpt, neoUrlOpt, neoUserOpt, neoPassOpt
 };
 
 scanCmd.SetHandler(async (ctx) =>
@@ -134,6 +158,28 @@ scanCmd.SetHandler(async (ctx) =>
         await new Neo4jCypherExporter().ExportAsync(graph, cypherPath, cts.Token);
     }
 
+    if (ctx.ParseResult.GetValueForOption(pushOpt))
+    {
+        var neoUrl  = ctx.ParseResult.GetValueForOption(neoUrlOpt)!;
+        var neoUser = ctx.ParseResult.GetValueForOption(neoUserOpt);
+        var neoPass = ctx.ParseResult.GetValueForOption(neoPassOpt);
+
+        Console.WriteLine("Pushing cross-API metadata to Neo4j…");
+        try
+        {
+            await using var store = new Neo4jGraphStore(neoUrl, neoUser, neoPass);
+            await store.VerifyConnectivityAsync();
+            await store.EnsureConstraintsAsync();
+            var info = CrossApiExtractor.Extract(graph, baseName);
+            await store.PushApiAsync(info, cts.Token);
+            Console.WriteLine($"  Pushed {info.EntryPoints.Count} entry points, {info.OutboundCalls.Count} outbound calls.");
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"  Neo4j push failed: {ex.Message}");
+        }
+    }
+
     Console.WriteLine();
     Console.WriteLine("Done.");
     Console.WriteLine("════════════════════════════════════════════════");
@@ -192,18 +238,60 @@ renderCmd.SetHandler(async (ctx) =>
 });
 
 // ════════════════════════════════════════════════════════════════════════════════
+// 'cross-view' subcommand  – generate a live HTML page that pulls cross-API data
+//                            from a Neo4j-compatible database at browser runtime
+// ════════════════════════════════════════════════════════════════════════════════
+var crossViewCmd = new Command("cross-view",
+    "Generate a live HTML page that visualises cross-API data stored in Neo4j.")
+{
+    outputOpt, neoUrlOpt, neoUserOpt, neoPassOpt
+};
+
+crossViewCmd.SetHandler(async (ctx) =>
+{
+    var output  = ctx.ParseResult.GetValueForOption(outputOpt)!;
+    var neoUrl  = ctx.ParseResult.GetValueForOption(neoUrlOpt)!;
+    var neoUser = ctx.ParseResult.GetValueForOption(neoUserOpt);
+    var _       = ctx.ParseResult.GetValueForOption(neoPassOpt);  // not embedded in page
+
+    Directory.CreateDirectory(output);
+
+    var htmlPath = Path.Combine(output, "cross-api-live.html");
+    var cts = new CancellationTokenSource();
+    Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
+
+    Console.WriteLine();
+    Console.WriteLine("════════════════════════════════════════════════");
+    Console.WriteLine("  dotnet-graph-scanner cross-view");
+    Console.WriteLine("════════════════════════════════════════════════");
+    Console.WriteLine($"  Output  : {Path.GetFullPath(htmlPath)}");
+    Console.WriteLine($"  Neo4j   : {neoUrl}");
+    Console.WriteLine();
+
+    await new CrossApiLiveHtmlExporter(
+        boltUrl: neoUrl,
+        defaultUser: neoUser ?? "neo4j"
+    ).ExportAsync(htmlPath, cts.Token);
+
+    Console.WriteLine();
+    Console.WriteLine("Done.");
+    Console.WriteLine("════════════════════════════════════════════════");
+});
+
+// ════════════════════════════════════════════════════════════════════════════════
 // Root command
 // ════════════════════════════════════════════════════════════════════════════════
 var rootCmd = new RootCommand("dotnet-graph-scanner – map a .NET codebase into a dependency graph")
 {
     scanCmd,
     renderCmd,
+    crossViewCmd,
 };
 
 // Keep the old behaviour: if the first argument looks like a .sln/.csproj path
 // (not a subcommand name), forward transparently to 'scan' so existing scripts
 // don't break.
-if (args.Length > 0 && args[0] is not ("scan" or "render" or "--help" or "-h" or "--version"))
+if (args.Length > 0 && args[0] is not ("scan" or "render" or "cross-view" or "--help" or "-h" or "--version"))
     args = ["scan", .. args];
 
 return await rootCmd.InvokeAsync(args);

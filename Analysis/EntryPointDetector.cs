@@ -216,6 +216,40 @@ public static class EntryPointDetector
             node.Meta["functionName"] = fnName;
             graph.AddEdge(projectId, id, EdgeKind.EntryPoint);
         }
+
+        // ── Cross-API outbound calls ([ApiCall]) ──────────────────────────────
+        // Methods (typically on typed HTTP-client interfaces/classes) that are
+        // decorated with [ApiCall("TargetApi", "VERB /route")] are tagged so that
+        // MultiApiAnalyzer can trace which entry points indirectly invoke them.
+        foreach (var method in root.DescendantNodes().OfType<MethodDeclarationSyntax>())
+        {
+            var sym = model.GetDeclaredSymbol(method);
+            if (sym is null) continue;
+
+            foreach (var attr in sym.GetAttributes())
+            {
+                if (attr.AttributeClass is null) continue;
+                if (StripSuffix(attr.AttributeClass.Name, "Attribute") != "ApiCall") continue;
+
+                var targetApi   = attr.ConstructorArguments.Length > 0
+                    ? attr.ConstructorArguments[0].Value as string : null;
+                var targetRoute = attr.ConstructorArguments.Length > 1
+                    ? attr.ConstructorArguments[1].Value as string : null;
+
+                if (targetApi is null || targetRoute is null) continue;
+
+                var id = SymbolId(sym);
+                EnsureMethodNode(graph, sym, id);
+                var node = graph.Nodes[id];
+                node.Meta["isApiCall"]    = "true";
+                node.Meta["targetApi"]    = targetApi;
+                node.Meta["targetRoute"]  = targetRoute;
+
+                // An ExternalApiCall edge from the project makes these nodes
+                // discoverable without walking the full call graph.
+                graph.AddEdge(projectId, id, EdgeKind.ExternalApiCall);
+            }
+        }
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────

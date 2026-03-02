@@ -27,5 +27,11 @@ public enum EdgeKind
     Accesses,
 
     /// <summary>Type or method is decorated with an attribute class.</summary>
-    UsesAttribute
+    UsesAttribute,
+
+    /// <summary>
+    /// A method calls an endpoint on an external API.
+    /// The edge's target is a virtual node representing the external API endpoint.
+    /// </summary>
+    ExternalApiCall
 }
