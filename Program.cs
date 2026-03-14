@@ -171,8 +171,7 @@ scanCmd.SetHandler(async (ctx) =>
             await store.VerifyConnectivityAsync();
             await store.EnsureConstraintsAsync();
             var info = CrossApiExtractor.Extract(graph, baseName);
-            await store.PushApiAsync(info, cts.Token);
-            Console.WriteLine($"  Pushed {info.EntryPoints.Count} entry points, {info.OutboundCalls.Count} outbound calls.");
+            await store.PushApiAsync(info, graph, cts.Token);
         }
         catch (Exception ex)
         {
@@ -268,7 +267,7 @@ crossViewCmd.SetHandler(async (ctx) =>
     Console.WriteLine($"  Neo4j   : {neoUrl}");
     Console.WriteLine();
 
-    await new CrossApiLiveHtmlExporter(
+    await new UnifiedLiveHtmlExporter(
         boltUrl: neoUrl,
         defaultUser: neoUser ?? "neo4j"
     ).ExportAsync(htmlPath, cts.Token);
@@ -279,6 +278,191 @@ crossViewCmd.SetHandler(async (ctx) =>
 });
 
 // ════════════════════════════════════════════════════════════════════════════════
+// 'impact' subcommand  – find HTTP endpoints affected by changed code
+// ════════════════════════════════════════════════════════════════════════════════
+var impFileOpt = new Option<string?>(
+    aliases: ["--file"],
+    description: "File path fragment to match against CodeNode.filePath.");
+
+var impFnOpt = new Option<string?>(
+    aliases: ["--function"],
+    description: "Function/method name fragment to match against CodeNode.label.");
+
+var impCommitOpt = new Option<string?>(
+    aliases: ["--commit"],
+    description: "Git commit SHA. Changed files and functions are resolved via git diff.");
+
+var impRangeOpt = new Option<string?>(
+    aliases: ["--commit-range"],
+    description: "Git commit range (e.g. abc123..def456).");
+
+var impRepoOpt = new Option<string>(
+    aliases: ["--repo"],
+    description: "Path to the git repository root (used with --commit / --commit-range).",
+    getDefaultValue: () => ".");
+
+var impApiOpt = new Option<string?>(
+    aliases: ["--api"],
+    description: "Filter results to a specific API name.");
+
+var impCmd = new Command("impact",
+    "Find HTTP entry points affected by changed files, functions, or git commits.")
+{
+    impFileOpt, impFnOpt, impCommitOpt, impRangeOpt, impRepoOpt, impApiOpt,
+    neoUrlOpt, neoUserOpt, neoPassOpt
+};
+
+impCmd.SetHandler(async (ctx) =>
+{
+    var file        = ctx.ParseResult.GetValueForOption(impFileOpt);
+    var fn          = ctx.ParseResult.GetValueForOption(impFnOpt);
+    var commit      = ctx.ParseResult.GetValueForOption(impCommitOpt);
+    var commitRange = ctx.ParseResult.GetValueForOption(impRangeOpt);
+    var repo        = ctx.ParseResult.GetValueForOption(impRepoOpt)!;
+    var apiFilter   = ctx.ParseResult.GetValueForOption(impApiOpt);
+    var neoUrl      = ctx.ParseResult.GetValueForOption(neoUrlOpt)!;
+    var neoUser     = ctx.ParseResult.GetValueForOption(neoUserOpt);
+    var neoPass     = ctx.ParseResult.GetValueForOption(neoPassOpt);
+
+    var filePaths = new List<string>();
+    var fnNames   = new List<string>();
+
+    if (file is not null) filePaths.Add(file);
+    if (fn   is not null) fnNames.Add(fn);
+
+    // Git resolution for --commit / --commit-range
+    if (commit is not null || commitRange is not null)
+    {
+        var range    = commitRange ?? $"{commit}^..{commit}";
+        var repoPath = Path.GetFullPath(repo);
+
+        Console.WriteLine($"  Resolving git diff: {range} in {repoPath}");
+
+        var diffFiles = await RunGitAsync(repoPath, $"diff --name-only {range}");
+        foreach (var f in diffFiles.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var trimmed = f.Trim();
+            if (!string.IsNullOrEmpty(trimmed) &&
+                trimmed.EndsWith(".cs", StringComparison.OrdinalIgnoreCase))
+                // Normalise to OS path separator: git always emits '/' but the
+                // DB stores paths with Path.DirectorySeparatorChar ('\' on Windows).
+                filePaths.Add(trimmed.Replace('/', Path.DirectorySeparatorChar));
+        }
+
+        // Extract changed function names from hunk context lines (@@ ... @@ MethodName)
+        foreach (var csFile in filePaths.ToList())
+        {
+            // git always expects forward slashes; restore them for the command argument.
+            var gitPath = csFile.Replace(Path.DirectorySeparatorChar, '/');
+            var diffText = await RunGitAsync(repoPath, $"diff -U0 {range} -- \"{gitPath}\"");
+            foreach (var line in diffText.Split('\n'))
+            {
+                var m = System.Text.RegularExpressions.Regex.Match(
+                    line, @"^@@ [^@]+ @@ (.+)$");
+                if (!m.Success) continue;
+                // Extract identifier before first '(' — usually the method name
+                var ident = System.Text.RegularExpressions.Regex.Match(
+                    m.Groups[1].Value, @"(\w+)\s*[\.(<]");
+                if (ident.Success)
+                    fnNames.Add(ident.Groups[1].Value);
+            }
+        }
+
+        Console.WriteLine(
+            $"  Resolved {filePaths.Count} changed .cs file(s), " +
+            $"{fnNames.Count} changed function(s)");
+    }
+
+    if (filePaths.Count == 0 && fnNames.Count == 0)
+    {
+        Console.Error.WriteLine(
+            "Nothing to query. Provide --file, --function, --commit, or --commit-range.");
+        ctx.ExitCode = 1;
+        return;
+    }
+
+    Console.WriteLine();
+    Console.WriteLine("════════════════════════════════════════════════");
+    Console.WriteLine("  dotnet-graph-scanner impact");
+    Console.WriteLine("════════════════════════════════════════════════");
+    if (filePaths.Count > 0)
+        Console.WriteLine($"  Files     : {string.Join(", ", filePaths)}");
+    if (fnNames.Count > 0)
+        Console.WriteLine($"  Functions : {string.Join(", ", fnNames.Distinct())}");
+    if (apiFilter is not null)
+        Console.WriteLine($"  API filter: {apiFilter}");
+    Console.WriteLine();
+
+    try
+    {
+        await using var store = new DotNetGraphScanner.Store.Neo4jGraphStore(neoUrl, neoUser, neoPass);
+        await store.VerifyConnectivityAsync();
+        var results = await store.QueryImpactAsync(
+            filePaths, fnNames.Distinct().ToList(), apiFilter);
+
+        if (results.Count == 0)
+        {
+            Console.WriteLine("  No affected endpoints found.");
+        }
+        else
+        {
+            Console.WriteLine($"  {"API",-22} {"Method",-8} {"Route",-45} Label");
+            Console.WriteLine($"  {new string('-', 22)} {new string('-', 8)} {new string('-', 45)} {new string('-', 20)}");
+            foreach (var (api, method, route, label) in results)
+                Console.WriteLine($"  {api,-22} {method,-8} {route,-45} {label}");
+            Console.WriteLine();
+            Console.WriteLine($"  {results.Count} affected endpoint(s) found.");
+        }
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"  Impact query failed: {ex.Message}");
+        ctx.ExitCode = 1;
+    }
+
+    Console.WriteLine();
+    Console.WriteLine("Done.");
+    Console.WriteLine("════════════════════════════════════════════════");
+});
+
+// ════════════════════════════════════════════════════════════════════════════════
+// 'diagnostic' subcommand  – query the live DB and report what's stored
+// ════════════════════════════════════════════════════════════════════════════════
+var diagCmd = new Command("diagnostic",
+    "Query the Neo4j database and print a diagnostic report of what's captured.")
+{
+    neoUrlOpt, neoUserOpt, neoPassOpt
+};
+
+diagCmd.SetHandler(async (ctx) =>
+{
+    var neoUrl  = ctx.ParseResult.GetValueForOption(neoUrlOpt)!;
+    var neoUser = ctx.ParseResult.GetValueForOption(neoUserOpt);
+    var neoPass = ctx.ParseResult.GetValueForOption(neoPassOpt);
+
+    var cts = new CancellationTokenSource();
+    Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
+
+    Console.WriteLine();
+    Console.WriteLine("════════════════════════════════════════════════");
+    Console.WriteLine("  dotnet-graph-scanner diagnostic");
+    Console.WriteLine("════════════════════════════════════════════════");
+    Console.WriteLine($"  Neo4j   : {neoUrl}");
+
+    try
+    {
+        await using var store = new DotNetGraphScanner.Store.Neo4jGraphStore(neoUrl, neoUser, neoPass);
+        await store.VerifyConnectivityAsync();
+        await store.RunDiagnosticAsync(cts.Token);
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"  Diagnostic failed: {ex.Message}");
+        ctx.ExitCode = 1;
+    }
+});
+
+// ════════════════════════════════════════════════════════════════════════════════
 // Root command
 // ════════════════════════════════════════════════════════════════════════════════
 var rootCmd = new RootCommand("dotnet-graph-scanner – map a .NET codebase into a dependency graph")
@@ -286,12 +470,33 @@ var rootCmd = new RootCommand("dotnet-graph-scanner – map a .NET codebase into
     scanCmd,
     renderCmd,
     crossViewCmd,
+    impCmd,
+    diagCmd,
 };
 
 // Keep the old behaviour: if the first argument looks like a .sln/.csproj path
 // (not a subcommand name), forward transparently to 'scan' so existing scripts
 // don't break.
-if (args.Length > 0 && args[0] is not ("scan" or "render" or "cross-view" or "--help" or "-h" or "--version"))
+if (args.Length > 0 && args[0] is not ("scan" or "render" or "cross-view" or "impact" or "diagnostic" or "--help" or "-h" or "--version"))
     args = ["scan", .. args];
 
 return await rootCmd.InvokeAsync(args);
+
+// ── Git helper ────────────────────────────────────────────────────────────────
+static async Task<string> RunGitAsync(string repoPath, string gitArgs)
+{
+    var psi = new System.Diagnostics.ProcessStartInfo
+    {
+        FileName               = "git",
+        Arguments              = $"-C \"{repoPath}\" {gitArgs}",
+        RedirectStandardOutput = true,
+        RedirectStandardError  = true,
+        UseShellExecute        = false,
+        CreateNoWindow         = true
+    };
+    using var proc = System.Diagnostics.Process.Start(psi)
+        ?? throw new InvalidOperationException("Failed to start git process.");
+    var output = await proc.StandardOutput.ReadToEndAsync();
+    await proc.WaitForExitAsync();
+    return output;
+}

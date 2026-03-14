@@ -59,9 +59,11 @@ public sealed class SolutionAnalyzer
                 ["language"] = project.Language
             });
 
-            // Add to a synthetic root
-            var rootId = $"solution:single";
-            graph.AddNode(rootId, Path.GetFileNameWithoutExtension(path), NodeKind.Solution);
+            // Add to a synthetic root – ID is unique per project so that multiple
+            // .csproj pushes don't collapse onto the same node in the database.
+            var projName = Path.GetFileNameWithoutExtension(path);
+            var rootId   = $"solution:csproj:{projName.ToLowerInvariant()}";
+            graph.AddNode(rootId, projName, NodeKind.Solution);
             graph.AddEdge(rootId, projNodeId, EdgeKind.Contains);
 
             await AnalyzeProjectAsync(project, graph, rootId, ct);

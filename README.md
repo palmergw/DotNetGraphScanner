@@ -2,15 +2,7 @@
 
 A CLI tool that uses **Roslyn** to statically analyse a .NET solution or project and produce an **interactive dependency graph** — mapping entry points, method call chains, type hierarchies, and package references.
 
-Also supports **cross-API dependency mapping**: scan individual APIs, push their metadata to a [Memgraph](https://memgraph.com/) (or Neo4j-compatible) database, and open a **live UI** that always shows the latest cross-API connections.
-
----
-
-## Interactive Preview
-
-▶ **[Open cross-API map (FooApi ↔ BarApi)](https://htmlpreview.github.io/?https://github.com/palmergw/DotNetGraphScanner/blob/master/sample-output/FooApi-BarApi.cross.html)**
-
-Static snapshot of the FooApi ↔ BarApi dependency map generated from the bundled sample projects. Shows entry points, outbound cross-API calls, and BFS-reachability impact analysis. Click any box to explore.
+Also supports **full-graph database storage**: scan individual APIs, push the complete code graph plus cross-API metadata to a [Memgraph](https://memgraph.com/) (or Neo4j-compatible) database, and explore everything in a **live unified UI** — or query impact from the CLI using file paths, function names, or git commits.
 
 ---
 
@@ -24,6 +16,7 @@ Static snapshot of the FooApi ↔ BarApi dependency map generated from the bundl
 | **Project References** | `.csproj → .csproj` relationships |
 | **NuGet Packages** | `PackageReference` items from every `.csproj` |
 | **Cross-API Calls** | Outbound HTTP calls between APIs annotated with `[ApiCall]` |
+| **Source Location** | `filePath` + `lineStart` stored on every method node for git-to-graph mapping |
 
 ### Outputs
 
@@ -32,7 +25,7 @@ Static snapshot of the FooApi ↔ BarApi dependency map generated from the bundl
 | `<name>.graph.html` | Self-contained HTML + D3.js | Open in any browser — interactive force-directed graph |
 | `<name>.graph.json` | JSON `{nodes, edges}` | Feed to any downstream tool or custom renderer |
 | `<name>.graph.cypher` | Neo4j Cypher | `cypher-shell -f <file>` or paste into Neo4j Browser |
-| `cross-api-live.html` | Self-contained HTML | Live cross-API dependency map — queries the database in your browser |
+| `cross-api-live.html` | Self-contained HTML | Live unified explorer — three views, queries the database in your browser |
 
 ---
 
@@ -46,14 +39,20 @@ dotnet build
 # Scan a solution
 dotnet run -- path/to/MyApp.sln --output ./out
 
-# Scan a project and push cross-API metadata to the database
+# Scan a project and push the full code graph + cross-API metadata to the database
 dotnet run -- scan path/to/MyApi.csproj --output ./out --push
 
 # Re-render an existing JSON without re-scanning
 dotnet run -- render ./out/MyApp.graph.json --output ./out
 
-# Generate the live cross-API viewer HTML
+# Generate the unified live explorer HTML
 dotnet run -- cross-view --output ./out
+
+# Find which endpoints are affected by a changed file
+dotnet run -- impact --file WeatherController.cs
+
+# Find impact of a git commit
+dotnet run -- impact --commit a1b2c3d --repo ../MyRepo
 
 # Open the results
 start ./out/MyApp.graph.html
@@ -62,7 +61,7 @@ start ./out/cross-api-live.html
 
 ---
 
-## Cross-API Mapping
+## Cross-API Mapping with Full Code Graph
 
 ### How it works
 
@@ -82,11 +81,23 @@ start ./out/cross-api-live.html
    }
    ```
 
-2. **Scan each API individually** — pass `--push` to write the entry points, outbound calls, and internal impact map to the database. Each push also re-resolves all `RESOLVES_TO` edges across every API already in the database, so connections are always current.
+2. **Scan each API individually** with `--push`. This writes:
+   - **Full code graph** — every `CodeNode` (Class, Method, Namespace, etc.) with `filePath` + `lineStart` and all structural edges (`CALLS`, `CONTAINS`, `INHERITS`, etc.)
+   - **Cross-API layer** — `EntryPoint` / `OutboundCall` nodes, `CAN_REACH` impact edges, and `RESOLVES_TO` connections (rebuilt across all APIs after each push)
 
-3. **Open the live viewer** — run `cross-view` once to generate `cross-api-live.html`. Open it in a browser, enter your database password, and click **Connect**. The page queries the database directly — hit **Refresh** at any time to pick up new scans without regenerating the file.
+3. **Open the unified live explorer** — run `cross-view` once to generate `cross-api-live.html`. Open it in a browser, connect to the database, and switch between views using the dropdown in the connection bar.
 
-4. **Impact analysis** — click any entry point to see every outbound API call that could be triggered from it. Click any outbound call to see which entry points on its own API can cause it, and which entry point on the target API it resolves to.
+4. **Run impact analysis from the CLI** — use the `impact` subcommand to find which HTTP endpoints are reachable from a changed file, function, or git commit.
+
+### Live Explorer Views
+
+The `cross-api-live.html` page has three views selectable from a dropdown in the connection bar:
+
+| View | What it shows |
+|---|---|
+| **🔗 API Dependencies** | Cross-API card layout — entry points, outbound calls, resolved connections, BFS impact panel. Click any pill to highlight its connections. |
+| **🕸 Code Graph** | Per-API D3 force-directed canvas — select an API from the dropdown to render its full code graph. Filter by node kind or search by label. Click a node for file/line metadata. |
+| **🎯 Impact Explorer** | Enter a file path fragment, function name, or paste a resolved file list to find affected HTTP endpoints across all APIs. For git commit analysis, use the `impact` CLI subcommand instead. |
 
 ### `scan --push` options
 
@@ -107,7 +118,7 @@ Core options:
   --include-external       Show external (framework/NuGet) nodes in HTML
 
 Cross-API / database options:
-  --push                   Push cross-API metadata to the database after scanning
+  --push                   Push full code graph + cross-API metadata to the database
   --neo4j-url <url>        Bolt URL of the database [default: bolt://127.0.0.1:7687]
   --neo4j-user <user>      Database username [default: neo4j]
   --neo4j-pass <pass>      Database password
@@ -125,6 +136,43 @@ Options:
   --neo4j-pass <pass>      (Not embedded in the page — for connectivity check only)
   -?, -h, --help           Show help
 ```
+
+### `impact` command
+
+Finds HTTP entry points reachable from changed code by traversing `CALLS` edges in the stored code graph. Requires `scan --push` to have been run first.
+
+```
+Usage: dotnet-graph-scanner impact [options]
+
+Options:
+  --file <fragment>          File path fragment to match (e.g. WeatherController.cs)
+  --function <name>          Method name fragment to match (e.g. GetWeatherForecast)
+  --commit <sha>             Git commit SHA — resolves changed files and functions via git diff
+  --commit-range <from..to>  Git commit range (e.g. abc123..def456)
+  --repo <path>              Git repository root used with --commit / --commit-range [default: .]
+  --api <name>               Filter results to a specific API name
+  --neo4j-url <url>          Bolt URL of the database [default: bolt://127.0.0.1:7687]
+  --neo4j-user <user>        Database username [default: neo4j]
+  --neo4j-pass <pass>        Database password
+```
+
+**Examples:**
+
+```powershell
+# Which endpoints are affected if WeatherController.cs changes?
+dotnet run -- impact --file WeatherController.cs
+
+# Which endpoints call into a specific method?
+dotnet run -- impact --function ProcessOrder
+
+# Which endpoints are affected by the changes in a commit?
+dotnet run -- impact --commit a1b2c3d --repo ../MyRepo
+
+# Same, scoped to one API
+dotnet run -- impact --commit-range main~5..main --repo ../MyRepo --api OrdersApi
+```
+
+For `--commit` / `--commit-range`, the tool shells out to `git diff --name-only` to resolve changed `.cs` files, then parses hunk context headers (`@@ … @@ MethodName`) to also extract changed function names. No git library dependency required.
 
 ### Sample APIs
 
@@ -213,27 +261,26 @@ DotNetGraphScanner/
 │   ├── ScanOptions.cs              Options passed to the analyzer
 │   ├── SolutionAnalyzer.cs         Opens .sln/.csproj via MSBuildWorkspace
 │   ├── EntryPointDetector.cs       Detects Main, controllers, minimal APIs, Azure Fns, [ApiCall]
-│   ├── CallGraphWalker.cs          CSharpSyntaxWalker → CALLS edges
-│   ├── DependencyAnalyzer.cs       Type hierarchy + namespace nodes
+│   ├── CallGraphWalker.cs          CSharpSyntaxWalker → CALLS edges; records filePath + lineStart
+│   ├── DependencyAnalyzer.cs       Type hierarchy + namespace nodes; records filePath on type nodes
 │   ├── ProjectFileAnalyzer.cs      Parses .csproj for PackageReference/ProjectReference
 │   └── CrossApiExtractor.cs        Extracts per-API cross-API metadata (EPs, outbound calls, BFS impact)
 ├── Export/
 │   ├── IGraphExporter.cs           Common export interface
-│   ├── HtmlExporter.cs             D3.js self-contained HTML output
+│   ├── HtmlExporter.cs             D3.js self-contained HTML output (force graph + hierarchy)
 │   ├── JsonExporter.cs             JSON {nodes, edges} output
 │   ├── Neo4jCypherExporter.cs      Cypher MERGE statements for Neo4j/Memgraph
-│   ├── CrossApiHtmlExporter.cs     Static API-box visual with impact analysis
-│   └── CrossApiLiveHtmlExporter.cs Live viewer HTML — queries the database in the browser
+│   └── UnifiedLiveHtmlExporter.cs  Live unified explorer HTML — three views, queries DB in browser
 ├── Store/
-│   └── Neo4jGraphStore.cs          Bolt persistence: push API, resolve connections, clear
+│   └── Neo4jGraphStore.cs          Bolt persistence: full code graph push, impact query, resolve connections
 ├── Graph/
 │   ├── GraphModel.cs               In-memory graph (thread-safe reads)
-│   ├── GraphNode.cs                Node with id, kind, isEntryPoint, meta
+│   ├── GraphNode.cs                Node with id, kind, isEntryPoint, meta (incl. filePath, lineStart)
 │   ├── GraphEdge.cs                Directed edge with kind, meta
 │   ├── NodeKind.cs                 Enum of node kinds
 │   ├── EdgeKind.cs                 Enum of edge relationship types (incl. ExternalApiCall)
 │   └── CrossApiModel.cs            Types: EntrypointInfo, ApiCallInfo, SingleApiCrossInfo, …
-└── Program.cs                      System.CommandLine entry point (scan, render, cross-view)
+└── Program.cs                      System.CommandLine entry point (scan, render, cross-view, impact)
 
 samples/
 ├── ApiContracts/               Shared [ApiCall] attribute
@@ -249,6 +296,8 @@ samples/
 
 ### Graph schema in the database
 
+**Cross-API layer** (lightweight, always present after `--push`):
+
 | Node | Key property | Description |
 |---|---|---|
 | `(:Api)` | `name` | One node per scanned project; carries `scannedAt` timestamp |
@@ -261,3 +310,26 @@ samples/
 | `HAS_OUTBOUND_CALL` | Api → OutboundCall | Ownership |
 | `CAN_REACH` | EntryPoint → OutboundCall | BFS reachability via internal call graph |
 | `RESOLVES_TO` | OutboundCall → EntryPoint | Route-matched cross-API connection |
+
+**Full code graph** (written by `--push`, used by the Code Graph view and `impact` command):
+
+| Node | Labels | Key properties |
+|---|---|---|
+| `(:CodeNode:Method)` | `CodeNode` + NodeKind | `id`, `label`, `kind`, `apiName`, `filePath`, `lineStart`, `fullName` |
+| `(:CodeNode:Class)` | `CodeNode` + NodeKind | `id`, `label`, `kind`, `apiName`, `filePath`, `namespace`, `fullName` |
+| `(:CodeNode:<Kind>)` | `CodeNode` + NodeKind | All meta key/value pairs from the in-memory graph flattened as properties |
+
+| Relationship | Description |
+|---|---|
+| `CALLS` | Method invocation |
+| `CONTAINS` | Parent → child containment (Project → Class → Method, etc.) |
+| `INHERITS` | Class inheritance |
+| `IMPLEMENTS` | Interface implementation |
+| `ACCESSES` | Method reads a property or field |
+| `PROJECT_REFERENCE` | Project → Project dependency |
+| `PACKAGE_REFERENCE` | Project → NuGet package |
+| `ENTRY_POINT` | Project/parent → entry-point node |
+| `USES_ATTRIBUTE` | Type or method decorated with an attribute class |
+| `EXTERNAL_API_CALL` | Method calls an external API endpoint |
+
+The `apiName` property on every `CodeNode` scopes cleanup — re-scanning an API deletes and rewrites only its own nodes, leaving other APIs untouched.

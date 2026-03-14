@@ -37,7 +37,8 @@ public static class DependencyAnalyzer
             var typeNode = graph.AddNode(typeId, sym.Name, nodeKind, meta: new()
             {
                 ["namespace"] = sym.ContainingNamespace?.ToDisplayString() ?? "",
-                ["fullName"]  = sym.ToDisplayString()
+                ["fullName"]  = sym.ToDisplayString(),
+                ["filePath"]  = tree.FilePath
             });
             // Promote: if this node was previously created as an external placeholder
             // (e.g. seen as an implemented interface before its own file was processed),
@@ -109,7 +110,8 @@ public static class DependencyAnalyzer
                     var propNode = graph.AddNode(propId, ps.Name, NodeKind.Property, meta: new()
                     {
                         ["fullName"] = ps.ToDisplayString(),
-                        ["type"]     = ps.Type.ToDisplayString()
+                        ["type"]     = ps.Type.ToDisplayString(),
+                        ["filePath"] = tree.FilePath
                     });
                     // Promote: CallGraphWalker may have pre-created this as an external placeholder.
                     if (propNode.Meta.TryGetValue("isExternal", out var propWasExt) && propWasExt == "true")
@@ -117,6 +119,7 @@ public static class DependencyAnalyzer
                         propNode.Meta.Remove("isExternal");
                         propNode.Meta["fullName"] = ps.ToDisplayString();
                         propNode.Meta["type"]     = ps.Type.ToDisplayString();
+                        propNode.Meta["filePath"] = tree.FilePath;
                     }
                     graph.AddEdge(typeId, propId, EdgeKind.Contains);
                     // Gap F: attribute usage on the property
@@ -137,7 +140,8 @@ public static class DependencyAnalyzer
                     graph.AddNode(fieldId, fs.Name, NodeKind.Field, meta: new()
                     {
                         ["fullName"] = fs.ToDisplayString(),
-                        ["type"]     = fs.Type.ToDisplayString()
+                        ["type"]     = fs.Type.ToDisplayString(),
+                        ["filePath"] = tree.FilePath
                     });
                     graph.AddEdge(typeId, fieldId, EdgeKind.Contains);
                 }

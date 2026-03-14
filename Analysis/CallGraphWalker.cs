@@ -78,6 +78,12 @@ public sealed class CallGraphWalker : CSharpSyntaxWalker
         {
             var id = EntryPointDetector.SymbolId(sym);
             EntryPointDetector.EnsureMethodNode(_graph, sym, id);
+            // Store source location so impact analysis can match by file/line
+            if (!_graph.Nodes[id].Meta.ContainsKey("filePath"))
+            {
+                _graph.Nodes[id].Meta["filePath"]  = _filePath;
+                _graph.Nodes[id].Meta["lineStart"] = (node.GetLocation().GetLineSpan().StartLinePosition.Line + 1).ToString();
+            }
             _currentMethod = sym;
             // Gap F: attribute usage on the method itself
             EmitAttributeEdges(id, sym.GetAttributes());
@@ -94,6 +100,11 @@ public sealed class CallGraphWalker : CSharpSyntaxWalker
         {
             var id = EntryPointDetector.SymbolId(sym);
             EntryPointDetector.EnsureMethodNode(_graph, sym, id);
+            if (!_graph.Nodes[id].Meta.ContainsKey("filePath"))
+            {
+                _graph.Nodes[id].Meta["filePath"]  = _filePath;
+                _graph.Nodes[id].Meta["lineStart"] = (node.GetLocation().GetLineSpan().StartLinePosition.Line + 1).ToString();
+            }
             _currentMethod = sym;
             EmitAttributeEdges(id, sym.GetAttributes());
         }
@@ -109,6 +120,11 @@ public sealed class CallGraphWalker : CSharpSyntaxWalker
         {
             var id = EntryPointDetector.SymbolId(sym);
             EntryPointDetector.EnsureMethodNode(_graph, sym, id);
+            if (!_graph.Nodes[id].Meta.ContainsKey("filePath"))
+            {
+                _graph.Nodes[id].Meta["filePath"]  = _filePath;
+                _graph.Nodes[id].Meta["lineStart"] = (node.GetLocation().GetLineSpan().StartLinePosition.Line + 1).ToString();
+            }
             _currentMethod = sym;
         }
         base.VisitDestructorDeclaration(node);
