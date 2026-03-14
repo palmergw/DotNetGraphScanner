@@ -164,14 +164,13 @@ scanCmd.SetHandler(async (ctx) =>
         var neoUser = ctx.ParseResult.GetValueForOption(neoUserOpt);
         var neoPass = ctx.ParseResult.GetValueForOption(neoPassOpt);
 
-        Console.WriteLine("Pushing cross-API metadata to Neo4j…");
+        Console.WriteLine("Pushing code graph to Neo4j…");
         try
         {
             await using var store = new Neo4jGraphStore(neoUrl, neoUser, neoPass);
             await store.VerifyConnectivityAsync();
             await store.EnsureConstraintsAsync();
-            var info = CrossApiExtractor.Extract(graph, baseName);
-            await store.PushApiAsync(info, graph, cts.Token);
+            await store.PushApiAsync(baseName, graph, cts.Token);
         }
         catch (Exception ex)
         {

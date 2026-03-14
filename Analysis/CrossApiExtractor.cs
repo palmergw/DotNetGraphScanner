@@ -3,108 +3,13 @@ using DotNetGraphScanner.Graph;
 namespace DotNetGraphScanner.Analysis;
 
 /// <summary>
-/// Extracts cross-API metadata from a single API's <see cref="GraphModel"/>.
-/// Runs BFS over the internal call graph (crossing virtual dispatch) to map
-/// entry points to the outbound [ApiCall] methods they can reach.
-/// The result is suitable for pushing to <see cref="Store.Neo4jGraphStore"/>
-/// or for direct in-process aggregation.
+/// Shared helpers for canonical cross-API matching logic.
 /// </summary>
 public static class CrossApiExtractor
 {
-    public static SingleApiCrossInfo Extract(GraphModel graph, string apiName)
-    {
-        // ── Entry points (HTTP endpoints only) ────────────────────────────────
-        var entryPoints = new List<EntrypointInfo>();
-        var seenEpIds   = new HashSet<string>();
-
-        foreach (var edge in graph.Edges.Where(e => e.Kind == EdgeKind.EntryPoint))
-        {
-            if (!graph.Nodes.TryGetValue(edge.TargetId, out var node)) continue;
-
-            node.Meta.TryGetValue("httpMethod",    out var verb);
-            node.Meta.TryGetValue("routeTemplate", out var route);
-
-            // Skip non-HTTP entry points (static Main, top-level program, etc.)
-            if (verb is null && route is null) continue;
-            if (!seenEpIds.Add(node.Id)) continue;
-
-            var httpMethod = verb  ?? "HTTP";
-            var routePath  = route ?? node.Label;
-
-            entryPoints.Add(new EntrypointInfo(
-                NodeId:     node.Id,
-                ApiName:    apiName,
-                HttpMethod: httpMethod,
-                Route:      routePath,
-                Label:      $"{httpMethod} {routePath}"));
-        }
-
-        // ── Outbound API call nodes ───────────────────────────────────────────
-        var outboundCalls = new List<ApiCallInfo>();
-        var seenCallIds   = new HashSet<string>();
-
-        foreach (var edge in graph.Edges.Where(e => e.Kind == EdgeKind.ExternalApiCall))
-        {
-            if (!graph.Nodes.TryGetValue(edge.TargetId, out var node)) continue;
-            if (!node.Meta.TryGetValue("targetApi",   out var targetApi))   continue;
-            if (!node.Meta.TryGetValue("targetRoute", out var targetRoute)) continue;
-            if (!seenCallIds.Add(node.Id)) continue;
-
-            outboundCalls.Add(new ApiCallInfo(
-                NodeId:      node.Id,
-                OwnerApi:    apiName,
-                TargetApi:   targetApi,
-                TargetRoute: targetRoute,
-                Label:       $"{apiName} → {targetApi}: {targetRoute}"));
-        }
-
-        // ── BFS reachability: entry point → outbound call nodes ───────────────
-        // Build Calls adjacency augmented with virtual dispatch edges so the BFS
-        // crosses interface → implementation boundaries transparently.
-        var successors = graph.Edges
-            .Where(e => e.Kind == EdgeKind.Calls)
-            .GroupBy(e => e.SourceId)
-            .ToDictionary(g => g.Key, g => g.Select(e => e.TargetId).ToHashSet());
-
-        foreach (var (ifaceMethodId, implIds) in BuildVirtualDispatchMap(graph))
-        {
-            if (!successors.ContainsKey(ifaceMethodId))
-                successors[ifaceMethodId] = new HashSet<string>();
-            foreach (var implId in implIds)
-                successors[ifaceMethodId].Add(implId);
-        }
-
-        var apiCallNodeIds = outboundCalls.Select(c => c.NodeId).ToHashSet();
-
-        var impacts = entryPoints.Select(ep =>
-        {
-            var reachable = new List<string>();
-            var visited   = new HashSet<string>();
-            var queue     = new Queue<string>();
-            queue.Enqueue(ep.NodeId);
-
-            while (queue.Count > 0)
-            {
-                var current = queue.Dequeue();
-                if (!visited.Add(current)) continue;
-
-                if (apiCallNodeIds.Contains(current))
-                    reachable.Add(current);
-
-                if (successors.TryGetValue(current, out var nexts))
-                    foreach (var next in nexts)
-                        queue.Enqueue(next);
-            }
-
-            return new ApiImpact(ep.NodeId, reachable.Distinct().ToList());
-        }).ToList();
-
-        return new SingleApiCrossInfo(apiName, entryPoints, outboundCalls, impacts);
-    }
-
     // ── Virtual dispatch: interface method → concrete implementations ─────────
 
-    private static Dictionary<string, HashSet<string>> BuildVirtualDispatchMap(GraphModel graph)
+    internal static Dictionary<string, HashSet<string>> BuildVirtualDispatchMap(GraphModel graph)
     {
         // Map each type node to its contained method node-IDs
         var typeToMethods = graph.Edges

@@ -5,22 +5,50 @@ using Neo4j.Driver;
 namespace DotNetGraphScanner.Store;
 
 /// <summary>
-/// Persists and retrieves cross-API dependency data in a Neo4j-compatible
+/// Persists and retrieves canonical code-graph dependency data in a Neo4j-compatible
 /// graph database.
 ///
 /// Graph schema:
-///   (:Api            { name, scannedAt })
-///   (:EntryPoint     { nodeId, apiName, httpMethod, route, label })
-///   (:OutboundCall   { nodeId, ownerApi, targetApi, targetRoute, label })
-///
-///   (:Api)-[:HAS_ENTRY_POINT]->(:EntryPoint)
-///   (:Api)-[:HAS_OUTBOUND_CALL]->(:OutboundCall)
-///   (:EntryPoint)-[:CAN_REACH]->(:OutboundCall)      — impact map
-///   (:OutboundCall)-[:RESOLVES_TO]->(:EntryPoint)    — cross-API resolved call
+///   (:Api      { name, scannedAt })
+///   (:CodeNode { id, kind, apiName, ... })
+///   (:CodeNode)-[:RESOLVES_TO]->(:CodeNode)
 /// </summary>
 public sealed class Neo4jGraphStore : IAsyncDisposable
 {
     private readonly IDriver _driver;
+
+    private readonly record struct ResolutionEntryPoint(
+        string NodeId,
+        string ApiName,
+        string HttpMethod,
+        string Route);
+
+    private readonly record struct ResolutionOutboundCall(
+        string NodeId,
+        string SourceApi,
+        string TargetApi,
+        string TargetRoute);
+
+    private readonly record struct ResolvedConnectionEdge(
+        string OutboundNodeId,
+        string EntryPointNodeId,
+        string SourceApi,
+        string TargetApi);
+
+    private readonly record struct ReachabilityNode(
+        string NodeId,
+        string Kind,
+        string? FullName);
+
+    private readonly record struct ReachabilityEdge(
+        string SourceId,
+        string Rel,
+        string TargetId);
+
+    private readonly record struct CanonicalImpactResult(
+        string EntryPointNodeId,
+        string ApiName,
+        IReadOnlyList<string> CallNodeIds);
 
     public Neo4jGraphStore(string uri, string? user = null, string? password = null)
     {
@@ -47,8 +75,6 @@ public sealed class Neo4jGraphStore : IAsyncDisposable
         var statements = new[]
         {
             "CREATE CONSTRAINT ON (a:Api)          ASSERT a.name   IS UNIQUE",
-            "CREATE CONSTRAINT ON (e:EntryPoint)   ASSERT e.nodeId IS UNIQUE",
-            "CREATE CONSTRAINT ON (o:OutboundCall) ASSERT o.nodeId IS UNIQUE",
             "CREATE CONSTRAINT ON (n:CodeNode)     ASSERT n.id     IS UNIQUE",
         };
 
@@ -63,30 +89,20 @@ public sealed class Neo4jGraphStore : IAsyncDisposable
 
     /// <summary>
     /// Pushes a single API's full graph to the database, overwriting any previous
-    /// data for that API. Writes all CodeNodes (structural code graph) and typed
-    /// relationships, as well as the cross-API metadata (EntryPoints, OutboundCalls,
-    /// impact edges). After writing, re-resolves all cross-API connections.
+    /// canonical CodeNode data for that API. After writing structural data, the
+    /// store re-resolves canonical cross-API connections.
     /// </summary>
-    public async Task PushApiAsync(SingleApiCrossInfo info, GraphModel graph, CancellationToken ct = default)
+    public async Task PushApiAsync(string apiName, GraphModel graph, CancellationToken ct = default)
     {
         await using var session = _driver.AsyncSession();
         var scannedAt = DateTimeOffset.UtcNow.ToString("o");
-
-        // 1. Remove existing nodes owned by this API
-        await (await session.RunAsync("""
-            MATCH (a:Api {name: $apiName})
-            OPTIONAL MATCH (a)-[:HAS_ENTRY_POINT]->(e:EntryPoint)
-            OPTIONAL MATCH (a)-[:HAS_OUTBOUND_CALL]->(o:OutboundCall)
-            DETACH DELETE e, o
-            """,
-            new Dictionary<string, object?> { ["apiName"] = info.ApiName })).ConsumeAsync();
 
         // 1b. Remove stale code nodes for this API
         await (await session.RunAsync("""
             MATCH (n:CodeNode {apiName: $apiName})
             DETACH DELETE n
             """,
-            new Dictionary<string, object?> { ["apiName"] = info.ApiName })).ConsumeAsync();
+            new Dictionary<string, object?> { ["apiName"] = apiName })).ConsumeAsync();
 
         // 2. Upsert the Api node
         await (await session.RunAsync("""
@@ -94,98 +110,35 @@ public sealed class Neo4jGraphStore : IAsyncDisposable
             SET a.scannedAt = $scannedAt
             """,
             new Dictionary<string, object?> {
-                ["apiName"]   = info.ApiName,
+                ["apiName"]   = apiName,
                 ["scannedAt"] = scannedAt
             })).ConsumeAsync();
 
-        // 3. Entry points (batched UNWIND)
-        if (info.EntryPoints.Count > 0)
-        {
-            var batch = info.EntryPoints
-                .Select(e => new Dictionary<string, object?> {
-                    ["nodeId"]     = e.NodeId,
-                    ["apiName"]    = e.ApiName,
-                    ["httpMethod"] = e.HttpMethod,
-                    ["route"]      = e.Route,
-                    ["label"]      = e.Label
-                })
-                .ToList<object>();
-
-            await (await session.RunAsync("""
-                UNWIND $batch AS ep
-                MERGE (e:EntryPoint {nodeId: ep.nodeId})
-                SET e.apiName    = ep.apiName,
-                    e.httpMethod = ep.httpMethod,
-                    e.route      = ep.route,
-                    e.label      = ep.label
-                WITH e, ep
-                MATCH (a:Api {name: ep.apiName})
-                MERGE (a)-[:HAS_ENTRY_POINT]->(e)
-                """,
-                new Dictionary<string, object?> { ["batch"] = batch })).ConsumeAsync();
-        }
-
-        // 4. Outbound calls (batched UNWIND)
-        if (info.OutboundCalls.Count > 0)
-        {
-            var batch = info.OutboundCalls
-                .Select(o => new Dictionary<string, object?> {
-                    ["nodeId"]      = o.NodeId,
-                    ["ownerApi"]    = o.OwnerApi,
-                    ["targetApi"]   = o.TargetApi,
-                    ["targetRoute"] = o.TargetRoute,
-                    ["label"]       = o.Label
-                })
-                .ToList<object>();
-
-            await (await session.RunAsync("""
-                UNWIND $batch AS oc
-                MERGE (o:OutboundCall {nodeId: oc.nodeId})
-                SET o.ownerApi    = oc.ownerApi,
-                    o.targetApi   = oc.targetApi,
-                    o.targetRoute = oc.targetRoute,
-                    o.label       = oc.label
-                WITH o, oc
-                MATCH (a:Api {name: oc.ownerApi})
-                MERGE (a)-[:HAS_OUTBOUND_CALL]->(o)
-                """,
-                new Dictionary<string, object?> { ["batch"] = batch })).ConsumeAsync();
-        }
-
-        // 5. CAN_REACH impact edges (batched)
-        var impactEdges = info.Impacts
-            .SelectMany(i => i.ReachableApiCallNodeIds
-                .Select(callId => new Dictionary<string, object?> {
-                    ["epId"]   = i.EntrypointNodeId,
-                    ["callId"] = callId
-                }))
-            .ToList<object>();
-
-        if (impactEdges.Count > 0)
-        {
-            await (await session.RunAsync("""
-                UNWIND $edges AS e
-                MATCH (ep:EntryPoint  {nodeId: e.epId})
-                MATCH (oc:OutboundCall {nodeId: e.callId})
-                MERGE (ep)-[:CAN_REACH]->(oc)
-                """,
-                new Dictionary<string, object?> { ["edges"] = impactEdges })).ConsumeAsync();
-        }
-
-        // 6. Write code-graph nodes (grouped by NodeKind to set dynamic labels)
+        // 3. Write code-graph nodes (grouped by NodeKind to set dynamic labels)
         var codeNodeCount = graph.Nodes.Count;
-        await WriteCodeNodesAsync(session, graph.Nodes.Values, info.ApiName, scannedAt);
+        await WriteCodeNodesAsync(session, graph.Nodes.Values, apiName, scannedAt);
 
-        // 7. Write structural edges (grouped by EdgeKind for relationship type)
+        // 4. Write structural edges (grouped by EdgeKind for relationship type)
         var edgeCount = graph.Edges.Count;
         await WriteStructuralEdgesAsync(session, graph.Edges);
 
-        Console.WriteLine($"  Neo4j ← {info.ApiName} " +
-            $"({info.EntryPoints.Count} EPs, {info.OutboundCalls.Count} outbound calls, " +
-            $"{impactEdges.Count} impact edges, " +
+        var entryPointCount = graph.Nodes.Values.Count(node =>
+            node.Kind == NodeKind.Method &&
+            node.IsEntryPoint &&
+            node.Meta.ContainsKey("httpMethod") &&
+            node.Meta.ContainsKey("routeTemplate"));
+        var outboundCallCount = graph.Nodes.Values.Count(node =>
+            node.Kind == NodeKind.Method &&
+            node.Meta.TryGetValue("isApiCall", out var isApiCall) &&
+            string.Equals(isApiCall, "true", StringComparison.OrdinalIgnoreCase) &&
+            node.Meta.ContainsKey("targetApi") &&
+            node.Meta.ContainsKey("targetRoute"));
+
+        Console.WriteLine($"  Neo4j ← {apiName} " +
+            $"({entryPointCount} EPs, {outboundCallCount} outbound calls, " +
             $"{codeNodeCount} code nodes, {edgeCount} structural edges)");
 
-        // 8. Re-resolve connections so the view is current
+        // 5. Re-resolve connections so the view is current
         await ResolveConnectionsAsync(ct);
     }
 
@@ -405,13 +358,8 @@ public sealed class Neo4jGraphStore : IAsyncDisposable
         foreach (var r in eps)
             Console.WriteLine($"  [{r["api"].As<string>(),-18}] {r["m"].As<string>(),-6} {r["rt"].As<string>()}");
 
-        // 5. Legacy vs canonical API dependency card counts
-        Console.WriteLine("\n  ── API dependency card parity ──────────────────────");
-        var legacyEpCounts = await Q("""
-            MATCH (a:Api)-[:HAS_ENTRY_POINT]->(e:EntryPoint)
-            RETURN a.name AS api, count(e) AS cnt
-            ORDER BY api
-            """);
+        // 5. API dependency card counts
+        Console.WriteLine("\n  ── API dependency card counts ─────────────────────");
         var canonicalEpCounts = await Q("""
             MATCH (e:CodeNode)
             WHERE e.kind = 'Method'
@@ -419,11 +367,6 @@ public sealed class Neo4jGraphStore : IAsyncDisposable
               AND e.httpMethod IS NOT NULL
               AND e.routeTemplate IS NOT NULL
             RETURN e.apiName AS api, count(e) AS cnt
-            ORDER BY api
-            """);
-        var legacyOutCounts = await Q("""
-            MATCH (a:Api)-[:HAS_OUTBOUND_CALL]->(o:OutboundCall)
-            RETURN a.name AS api, count(o) AS cnt
             ORDER BY api
             """);
         var canonicalOutCounts = await Q("""
@@ -440,34 +383,156 @@ public sealed class Neo4jGraphStore : IAsyncDisposable
             .GroupBy(r => r["api"].As<string>(), StringComparer.OrdinalIgnoreCase)
             .ToDictionary(g => g.Key, g => g.First()["cnt"].As<long>(), StringComparer.OrdinalIgnoreCase);
 
-        var legacyEpMap = ToCountMap(legacyEpCounts);
         var canonicalEpMap = ToCountMap(canonicalEpCounts);
-        var legacyOutMap = ToCountMap(legacyOutCounts);
         var canonicalOutMap = ToCountMap(canonicalOutCounts);
-        var parityApis = legacyEpMap.Keys
-            .Union(canonicalEpMap.Keys, StringComparer.OrdinalIgnoreCase)
-            .Union(legacyOutMap.Keys, StringComparer.OrdinalIgnoreCase)
+        var countApis = canonicalEpMap.Keys
             .Union(canonicalOutMap.Keys, StringComparer.OrdinalIgnoreCase)
             .OrderBy(a => a, StringComparer.OrdinalIgnoreCase)
             .ToList();
 
-        if (parityApis.Count == 0)
+        if (countApis.Count == 0)
             Console.WriteLine("  (no API dependency cards found)");
-        foreach (var api in parityApis)
+        foreach (var api in countApis)
         {
-            var legacyEp = legacyEpMap.GetValueOrDefault(api, 0);
             var canonEp = canonicalEpMap.GetValueOrDefault(api, 0);
-            var legacyOut = legacyOutMap.GetValueOrDefault(api, 0);
             var canonOut = canonicalOutMap.GetValueOrDefault(api, 0);
-            var marker = legacyEp == canonEp && legacyOut == canonOut ? "✓" : "✗";
-            Console.WriteLine($"  {marker} [{api,-18}] entry legacy={legacyEp,-3} canonical={canonEp,-3} | outbound legacy={legacyOut,-3} canonical={canonOut,-3}");
+            Console.WriteLine($"  • [{api,-18}] entry={canonEp,-3} outbound={canonOut,-3}");
         }
 
-        // 6. Cross-API connections resolved
-        var connCount = await Q("MATCH ()-[r:RESOLVES_TO]->() RETURN count(r) AS cnt");
-        Console.WriteLine($"\n  ── Cross-API resolved connections: {connCount[0]["cnt"].As<long>()} ──────────");
+        // 6. Canonical resolved connections
+        Console.WriteLine("\n  ── Canonical resolved connections ─────────────────");
+        var canonicalResolutionEntryRecs = await Q("""
+            MATCH (e:CodeNode)
+            WHERE e.kind = 'Method'
+              AND e.isEntryPoint = 'True'
+              AND e.httpMethod IS NOT NULL
+              AND e.routeTemplate IS NOT NULL
+            RETURN e.id AS nodeId, e.apiName AS apiName,
+                   e.httpMethod AS httpMethod, e.routeTemplate AS route
+            ORDER BY apiName, route
+            """);
+        var canonicalResolutionOutRecs = await Q("""
+            MATCH (o:CodeNode)
+            WHERE o.kind = 'Method'
+              AND o.isApiCall = 'true'
+              AND o.targetApi IS NOT NULL
+              AND o.targetRoute IS NOT NULL
+            RETURN o.id AS nodeId, o.apiName AS sourceApi,
+                   o.targetApi AS targetApi, o.targetRoute AS targetRoute
+            ORDER BY sourceApi, targetApi, targetRoute
+            """);
 
-        // 7. ApiCallAttribute node check
+        var canonicalResolved = ResolveResolvedConnections(
+            canonicalResolutionEntryRecs.Select(r => new ResolutionEntryPoint(
+                r["nodeId"].As<string>(),
+                r["apiName"].As<string>(),
+                r["httpMethod"].As<string>(),
+                r["route"].As<string>())).ToList(),
+            canonicalResolutionOutRecs.Select(r => new ResolutionOutboundCall(
+                r["nodeId"].As<string>(),
+                r["sourceApi"].As<string>(),
+                r["targetApi"].As<string>(),
+                r["targetRoute"].As<string>())).ToList());
+
+        var storedCanonicalConnCount = await Q("""
+            MATCH (o:CodeNode)-[r:RESOLVES_TO]->(e:CodeNode)
+            WHERE o.kind = 'Method'
+              AND e.kind = 'Method'
+            RETURN count(r) AS cnt
+            """);
+
+        static Dictionary<string, long> ToApiMatchCountMap(IEnumerable<ResolvedConnectionEdge> edges) =>
+            edges.GroupBy(e => e.SourceApi ?? string.Empty, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(g => g.Key, g => (long)g.Count(), StringComparer.OrdinalIgnoreCase);
+
+        var storedCanonicalCount = storedCanonicalConnCount[0]["cnt"].As<long>();
+        var storedMatchesComputed = storedCanonicalCount == canonicalResolved.Count;
+        Console.WriteLine($"  {(storedMatchesComputed ? '✓' : '✗')} computed={canonicalResolved.Count} stored={storedCanonicalCount}");
+
+        var canonicalResolvedByApi = ToApiMatchCountMap(canonicalResolved);
+        var resolutionApis = canonicalResolvedByApi.Keys
+            .OrderBy(a => a, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        foreach (var api in resolutionApis)
+        {
+            var canonicalCount = canonicalResolvedByApi.GetValueOrDefault(api, 0);
+            Console.WriteLine($"  • [{api,-18}] canonical-computed={canonicalCount,-3}");
+        }
+
+        // 7. Canonical reachability
+        Console.WriteLine("\n  ── Canonical reachability ─────────────────────────");
+        var canonicalImpactEntryRecs = await Q("""
+            MATCH (e:CodeNode)
+            WHERE e.kind = 'Method'
+              AND e.isEntryPoint = 'True'
+              AND e.httpMethod IS NOT NULL
+              AND e.routeTemplate IS NOT NULL
+            RETURN e.id AS nodeId, e.apiName AS apiName,
+                   e.httpMethod AS httpMethod, e.routeTemplate AS route
+            ORDER BY apiName, route
+            """);
+        var canonicalImpactOutRecs = await Q("""
+            MATCH (o:CodeNode)
+            WHERE o.kind = 'Method'
+              AND o.isApiCall = 'true'
+              AND o.targetApi IS NOT NULL
+              AND o.targetRoute IS NOT NULL
+            RETURN o.id AS nodeId, o.apiName AS sourceApi,
+                   o.targetApi AS targetApi, o.targetRoute AS targetRoute
+            ORDER BY sourceApi, targetApi, targetRoute
+            """);
+        var canonicalImpactNodeRecs = await Q("""
+            MATCH (n:CodeNode)
+            WHERE n.kind IN ['Method','Class','Interface','Struct']
+            RETURN n.id AS id, n.kind AS kind, n.fullName AS fullName
+            """);
+        var canonicalImpactEdgeRecs = await Q("""
+            MATCH (s:CodeNode)-[r]->(t:CodeNode)
+            WHERE type(r) IN ['CALLS','CONTAINS','IMPLEMENTS']
+            RETURN s.id AS src, type(r) AS rel, t.id AS tgt
+            """);
+
+        var canonicalImpacts = BuildCanonicalImpacts(
+            canonicalImpactEntryRecs.Select(r => new ResolutionEntryPoint(
+                r["nodeId"].As<string>(),
+                r["apiName"].As<string>(),
+                r["httpMethod"].As<string>(),
+                r["route"].As<string>())).ToList(),
+            canonicalImpactOutRecs.Select(r => new ResolutionOutboundCall(
+                r["nodeId"].As<string>(),
+                r["sourceApi"].As<string>(),
+                r["targetApi"].As<string>(),
+                r["targetRoute"].As<string>())).ToList(),
+            canonicalImpactNodeRecs.Select(r => new ReachabilityNode(
+                r["id"].As<string>(),
+                r["kind"].As<string>(),
+                r["fullName"].As<string?>())).ToList(),
+            canonicalImpactEdgeRecs.Select(r => new ReachabilityEdge(
+                r["src"].As<string>(),
+                r["rel"].As<string>(),
+                r["tgt"].As<string>())).ToList());
+
+        static Dictionary<string, long> ToApiImpactCountMap(IEnumerable<CanonicalImpactResult> impacts) =>
+            impacts.GroupBy(impact => impact.ApiName, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(
+                    group => group.Key,
+                    group => (long)group.Sum(impact => impact.CallNodeIds.Count),
+                    StringComparer.OrdinalIgnoreCase);
+
+        var canonicalImpactCount = canonicalImpacts.Sum(impact => impact.CallNodeIds.Count);
+        Console.WriteLine($"  • canonical BFS={canonicalImpactCount}");
+
+        var canonicalImpactByApi = ToApiImpactCountMap(canonicalImpacts);
+        var impactApis = canonicalImpactByApi.Keys
+            .OrderBy(api => api, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        foreach (var api in impactApis)
+        {
+            var canonicalCount = canonicalImpactByApi.GetValueOrDefault(api, 0);
+            Console.WriteLine($"  • [{api,-18}] canonical BFS={canonicalCount,-3}");
+        }
+
+        // 8. ApiCallAttribute node check
         Console.WriteLine("\n  ── ApiCallAttribute node ────────────────────────────");
         var attrNodes = await Q("MATCH (n:CodeNode {label:'ApiCallAttribute'}) RETURN n.apiName AS api, n.kind AS kind, n.filePath AS fp");
         if (attrNodes.Count == 0)
@@ -475,7 +540,7 @@ public sealed class Neo4jGraphStore : IAsyncDisposable
         foreach (var r in attrNodes)
             Console.WriteLine($"  ✓ apiName={r["api"].As<string>()}  kind={r["kind"].As<string>()}  filePath={r["fp"].As<string>()}");
 
-        // 8. Duplicate CodeNode id check
+        // 9. Duplicate CodeNode id check
         Console.WriteLine("\n  ── Duplicate CodeNode ids (should be empty) ──────────");
         var dups = await Q("""
             MATCH (n:CodeNode)
@@ -488,7 +553,7 @@ public sealed class Neo4jGraphStore : IAsyncDisposable
         foreach (var r in dups)
             Console.WriteLine($"  ⚠ id={r["id"].As<string>()[..Math.Min(60, r["id"].As<string>().Length)]}  cnt={r["cnt"].As<long>()}");
 
-        // 9. Property nodes from Models.cs - do they have filePath?
+        // 10. Property nodes from Models.cs - do they have filePath?
         var props = await Q("""
             MATCH (n:CodeNode {kind:'Property'})
             WHERE n.filePath IS NOT NULL
@@ -514,7 +579,7 @@ public sealed class Neo4jGraphStore : IAsyncDisposable
             Console.WriteLine($"    {rawFp}");
         }
 
-                // 10. Direct path: entry point → ACCESSES → Models.cs property (1 hop)
+                // 11. Direct path: entry point → ACCESSES → Models.cs property (1 hop)
         var direct = await Q("""
             MATCH (ep:CodeNode {isEntryPoint:'True'})-[:ACCESSES]->(n:CodeNode)
             WHERE n.filePath IS NOT NULL
@@ -532,7 +597,7 @@ public sealed class Neo4jGraphStore : IAsyncDisposable
             Console.WriteLine($"  [{r["api"].As<string>(),-14}] {r["rt"].As<string>(),-28} → {r["node"].As<string>()}");
         }
 
-                // 11. Paths via intermediate methods (2-3 hops)
+                // 12. Paths via intermediate methods (2-3 hops)
         var indirect = await Q("""
             MATCH (ep:CodeNode {isEntryPoint:'True'})-[:CALLS|ACCESSES*2..4]->(n:CodeNode)
             WHERE n.filePath IS NOT NULL
@@ -547,7 +612,7 @@ public sealed class Neo4jGraphStore : IAsyncDisposable
         foreach (var r in indirect)
             Console.WriteLine($"  [{r["api"].As<string>(),-14}] {r["rt"].As<string>(),-28} → {r["node"].As<string>()}");
 
-        // 12. Smoke-test impact query for Models.cs (FooApi)
+        // 13. Smoke-test impact query for Models.cs (FooApi)
         Console.WriteLine("\n  ── Impact smoke-test: 'models.cs' ───────────────────");
         try
         {
@@ -569,9 +634,9 @@ public sealed class Neo4jGraphStore : IAsyncDisposable
     // ── Connection resolution ─────────────────────────────────────────────────
 
     /// <summary>
-    /// (Re)builds all RESOLVES_TO edges between OutboundCall nodes and their
-    /// matching EntryPoint nodes on the target API.  Runs after every push so
-    /// the live view always reflects the current state of all APIs in the DB.
+    /// (Re)builds all RESOLVES_TO edges between outbound-call CodeNode methods
+    /// and matching entry-point CodeNode methods on the target API. Runs after
+    /// every push so the live view reflects the current state of all APIs.
     /// </summary>
     public async Task ResolveConnectionsAsync(CancellationToken ct = default)
     {
@@ -582,76 +647,219 @@ public sealed class Neo4jGraphStore : IAsyncDisposable
 
         // Fetch all entry points
         var epCursor = await session.RunAsync("""
-            MATCH (e:EntryPoint)
-            RETURN e.nodeId AS nodeId, e.apiName AS apiName,
-                   e.httpMethod AS httpMethod, e.route AS route
+            MATCH (e:CodeNode)
+            WHERE e.kind = 'Method'
+              AND e.isEntryPoint = 'True'
+              AND e.httpMethod IS NOT NULL
+              AND e.routeTemplate IS NOT NULL
+            RETURN e.id AS nodeId, e.apiName AS apiName,
+                   e.httpMethod AS httpMethod, e.routeTemplate AS route
             """);
-        var eps = await epCursor.ToListAsync(r => (
-            NodeId:     r["nodeId"].As<string>(),
-            ApiName:    r["apiName"].As<string>(),
-            HttpMethod: r["httpMethod"].As<string>(),
-            Route:      r["route"].As<string>()));
+        var eps = await epCursor.ToListAsync(r => new ResolutionEntryPoint(
+            r["nodeId"].As<string>(),
+            r["apiName"].As<string>(),
+            r["httpMethod"].As<string>(),
+            r["route"].As<string>()));
 
         // Fetch all outbound calls
         var outCursor = await session.RunAsync("""
-            MATCH (o:OutboundCall)
-            RETURN o.nodeId AS nodeId, o.targetApi AS targetApi, o.targetRoute AS targetRoute
+            MATCH (o:CodeNode)
+            WHERE o.kind = 'Method'
+              AND o.isApiCall = 'true'
+              AND o.targetApi IS NOT NULL
+              AND o.targetRoute IS NOT NULL
+            RETURN o.id AS nodeId, o.apiName AS sourceApi,
+                   o.targetApi AS targetApi, o.targetRoute AS targetRoute
             """);
-        var outs = await outCursor.ToListAsync(r => (
-            NodeId:      r["nodeId"].As<string>(),
-            TargetApi:   r["targetApi"].As<string>(),
-            TargetRoute: r["targetRoute"].As<string>()));
+        var outs = await outCursor.ToListAsync(r => new ResolutionOutboundCall(
+            r["nodeId"].As<string>(),
+            r["sourceApi"].As<string>(),
+            r["targetApi"].As<string>(),
+            r["targetRoute"].As<string>()));
 
-        // Build lookup: apiName → list of entry points
-        var epIndex = eps
-            .GroupBy(e => e.ApiName, StringComparer.OrdinalIgnoreCase)
-            .ToDictionary(g => g.Key, g => g.ToList(), StringComparer.OrdinalIgnoreCase);
-
-        // C#-side route matching (same logic as CrossApiExtractor)
-        var resolvedEdges = new List<object>();
-        foreach (var o in outs)
-        {
-            var parts = o.TargetRoute.Split(' ', 2, StringSplitOptions.TrimEntries);
-            var verb  = parts.Length > 1 ? parts[0].ToUpperInvariant() : "HTTP";
-            var path  = (parts.Length > 1 ? parts[1] : parts[0]).Trim('/').ToLowerInvariant();
-
-            if (!epIndex.TryGetValue(o.TargetApi, out var candidates)) continue;
-
-            var match = candidates.FirstOrDefault(ep =>
-                string.Equals(ep.HttpMethod.ToUpperInvariant(), verb, StringComparison.Ordinal) &&
-                CrossApiExtractor.RouteTemplatesMatch(
-                    ep.Route.Trim('/').ToLowerInvariant(), path));
-
-            if (match != default)
-                resolvedEdges.Add(new Dictionary<string, object?> {
-                    ["outId"] = o.NodeId,
-                    ["epId"]  = match.NodeId
-                });
-        }
+        var resolvedEdges = ResolveResolvedConnections(eps, outs)
+            .Select(edge => new Dictionary<string, object?> {
+                ["outId"] = edge.OutboundNodeId,
+                ["epId"] = edge.EntryPointNodeId
+            })
+            .ToList<object>();
 
         if (resolvedEdges.Count > 0)
         {
             await (await session.RunAsync("""
                 UNWIND $edges AS e
-                MATCH (o:OutboundCall {nodeId: e.outId})
-                MATCH (ep:EntryPoint   {nodeId: e.epId})
+                MATCH (o:CodeNode {id: e.outId})
+                MATCH (ep:CodeNode {id: e.epId})
                 MERGE (o)-[:RESOLVES_TO]->(ep)
                 """,
                 new Dictionary<string, object?> { ["edges"] = resolvedEdges })).ConsumeAsync();
         }
 
-        Console.WriteLine($"  Neo4j   resolved {resolvedEdges.Count} cross-API connections");
+        Console.WriteLine($"  Neo4j   resolved {resolvedEdges.Count} canonical cross-API connections");
+    }
+
+    private static List<ResolvedConnectionEdge> ResolveResolvedConnections(
+        IReadOnlyList<ResolutionEntryPoint> entryPoints,
+        IReadOnlyList<ResolutionOutboundCall> outboundCalls)
+    {
+        var epIndex = entryPoints
+            .GroupBy(e => e.ApiName, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(g => g.Key, g => g.ToList(), StringComparer.OrdinalIgnoreCase);
+
+        var resolvedEdges = new List<ResolvedConnectionEdge>();
+        foreach (var outboundCall in outboundCalls)
+        {
+            var parts = outboundCall.TargetRoute.Split(' ', 2, StringSplitOptions.TrimEntries);
+            var verb = parts.Length > 1 ? parts[0].ToUpperInvariant() : "HTTP";
+            var path = (parts.Length > 1 ? parts[1] : parts[0]).Trim('/').ToLowerInvariant();
+
+            if (!epIndex.TryGetValue(outboundCall.TargetApi, out var candidates))
+                continue;
+
+            var match = candidates.FirstOrDefault(entryPoint =>
+                string.Equals(entryPoint.HttpMethod.ToUpperInvariant(), verb, StringComparison.Ordinal) &&
+                CrossApiExtractor.RouteTemplatesMatch(
+                    entryPoint.Route.Trim('/').ToLowerInvariant(),
+                    path));
+
+            if (match == default)
+                continue;
+
+            resolvedEdges.Add(new ResolvedConnectionEdge(
+                outboundCall.NodeId,
+                match.NodeId,
+                outboundCall.SourceApi,
+                match.ApiName));
+        }
+
+        return resolvedEdges;
+    }
+
+    private static List<CanonicalImpactResult> BuildCanonicalImpacts(
+        IReadOnlyList<ResolutionEntryPoint> entryPoints,
+        IReadOnlyList<ResolutionOutboundCall> outboundCalls,
+        IReadOnlyList<ReachabilityNode> graphNodes,
+        IReadOnlyList<ReachabilityEdge> graphEdges)
+    {
+        var nodeById = graphNodes.ToDictionary(node => node.NodeId, StringComparer.OrdinalIgnoreCase);
+        var successors = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+        var typeToMethods = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+        var implEdges = new List<ReachabilityEdge>();
+
+        foreach (var edge in graphEdges)
+        {
+            if (string.Equals(edge.Rel, "CALLS", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!successors.TryGetValue(edge.SourceId, out var targets))
+                    successors[edge.SourceId] = targets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                targets.Add(edge.TargetId);
+                continue;
+            }
+
+            if (string.Equals(edge.Rel, "CONTAINS", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!nodeById.TryGetValue(edge.SourceId, out var srcNode) || !nodeById.TryGetValue(edge.TargetId, out var targetNode))
+                    continue;
+                if (targetNode.Kind != nameof(NodeKind.Method))
+                    continue;
+                if (srcNode.Kind is not (nameof(NodeKind.Interface) or nameof(NodeKind.Class) or nameof(NodeKind.Struct)))
+                    continue;
+
+                if (!typeToMethods.TryGetValue(edge.SourceId, out var methods))
+                    typeToMethods[edge.SourceId] = methods = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                methods.Add(edge.TargetId);
+                continue;
+            }
+
+            if (string.Equals(edge.Rel, "IMPLEMENTS", StringComparison.OrdinalIgnoreCase))
+                implEdges.Add(edge);
+        }
+
+        foreach (var edge in implEdges)
+        {
+            if (!typeToMethods.TryGetValue(edge.TargetId, out var interfaceMethods) || !typeToMethods.TryGetValue(edge.SourceId, out var classMethods))
+                continue;
+
+            var classBySignature = classMethods
+                .Select(methodId => (MethodId: methodId, Suffix: nodeById.TryGetValue(methodId, out var methodNode) ? GetMethodSuffix(methodNode.FullName) : null))
+                .Where(x => x.Suffix is not null)
+                .ToDictionary(x => x.Suffix!, x => x.MethodId, StringComparer.OrdinalIgnoreCase);
+
+            foreach (var interfaceMethodId in interfaceMethods)
+            {
+                if (!nodeById.TryGetValue(interfaceMethodId, out var interfaceMethodNode))
+                    continue;
+                var suffix = GetMethodSuffix(interfaceMethodNode.FullName);
+                if (suffix is null || !classBySignature.TryGetValue(suffix, out var classMethodId))
+                    continue;
+
+                if (!successors.TryGetValue(interfaceMethodId, out var implTargets))
+                    successors[interfaceMethodId] = implTargets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                implTargets.Add(classMethodId);
+            }
+        }
+
+        var apiCallIds = outboundCalls.Select(call => call.NodeId).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var impacts = new List<CanonicalImpactResult>();
+
+        foreach (var entryPoint in entryPoints)
+        {
+            var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var reachable = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var queue = new Queue<string>();
+            queue.Enqueue(entryPoint.NodeId);
+
+            while (queue.Count > 0)
+            {
+                var current = queue.Dequeue();
+                if (!visited.Add(current))
+                    continue;
+
+                if (apiCallIds.Contains(current))
+                    reachable.Add(current);
+
+                if (!successors.TryGetValue(current, out var nextIds))
+                    continue;
+
+                foreach (var nextId in nextIds)
+                    if (!visited.Contains(nextId))
+                        queue.Enqueue(nextId);
+            }
+
+            if (reachable.Count == 0)
+                continue;
+
+            impacts.Add(new CanonicalImpactResult(
+                entryPoint.NodeId,
+                entryPoint.ApiName,
+                reachable.OrderBy(id => id, StringComparer.OrdinalIgnoreCase).ToList()));
+        }
+
+        return impacts;
+    }
+
+    private static string? GetMethodSuffix(string? fullName)
+    {
+        if (string.IsNullOrWhiteSpace(fullName))
+            return null;
+
+        var parenIndex = fullName.IndexOf('(');
+        if (parenIndex < 0)
+            return null;
+
+        var dotBefore = fullName.LastIndexOf('.', parenIndex - 1);
+        return dotBefore >= 0 ? fullName[(dotBefore + 1)..] : fullName;
     }
 
     // ── Cleanup ───────────────────────────────────────────────────────────────
 
-    /// <summary>Removes all cross-API nodes and relationships from the database.</summary>
-    public async Task ClearAllAsync(CancellationToken ct = default)
+    /// <summary>Removes all stored Api and CodeNode data from the database.</summary>
+    public async Task ClearStoreAsync(CancellationToken ct = default)
     {
         await using var session = _driver.AsyncSession();
         await (await session.RunAsync("""
             MATCH (n)
-            WHERE n:Api OR n:EntryPoint OR n:OutboundCall
+            WHERE n:Api OR n:CodeNode
             DETACH DELETE n
             """)).ConsumeAsync();
     }

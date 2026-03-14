@@ -83,7 +83,7 @@ start ./out/cross-api-live.html
 
 2. **Scan each API individually** with `--push`. This writes:
    - **Full code graph** — every `CodeNode` (Class, Method, Namespace, etc.) with `filePath` + `lineStart` and all structural edges (`CALLS`, `CONTAINS`, `INHERITS`, etc.)
-   - **Cross-API layer** — `EntryPoint` / `OutboundCall` nodes, `CAN_REACH` impact edges, and `RESOLVES_TO` connections (rebuilt across all APIs after each push)
+  - **Canonical dependency metadata** — `Api` summary nodes, entry-point and outbound-call flags on `CodeNode`, canonical `CodeNode -> CodeNode RESOLVES_TO` connections, and enough structural edges to compute reachability directly from the stored graph
 
 3. **Open the unified live explorer** — run `cross-view` once to generate `cross-api-live.html`. Open it in a browser, connect to the database, and switch between views using the dropdown in the connection bar.
 
@@ -100,7 +100,7 @@ The `cross-api-live.html` page has three views selectable from a dropdown in the
 | **🎯 Impact Explorer** | Enter a file path fragment, function name, or paste a resolved file list to find affected HTTP endpoints across all APIs. For git commit analysis, use the `impact` CLI subcommand instead. |
 
 Implementation note:
-The live explorer now derives API Dependency cards from `CodeNode` and can fall back to `CodeNode.apiName` and `CodeNode.scannedAt` when `(:Api)` nodes have been removed. Legacy `EntryPoint` / `OutboundCall` data is still used as a compatibility fast path when present.
+The live explorer derives API Dependency cards from `CodeNode`, prefers stored `CodeNode -> CodeNode RESOLVES_TO` for connection rendering, and uses canonical virtual-dispatch-aware BFS for impact mapping. `Api` summary nodes are used for scan metadata when present, but the dependency view can still fall back to `CodeNode.apiName` and `CodeNode.scannedAt` if only `CodeNode` data is available.
 
 ### `scan --push` options
 
@@ -121,7 +121,7 @@ Core options:
   --include-external       Show external (framework/NuGet) nodes in HTML
 
 Cross-API / database options:
-  --push                   Push full code graph + cross-API metadata to the database
+  --push                   Push full code graph + canonical API dependency metadata to the database
   --neo4j-url <url>        Bolt URL of the database [default: bolt://127.0.0.1:7687]
   --neo4j-user <user>      Database username [default: neo4j]
   --neo4j-pass <pass>      Database password
@@ -267,7 +267,7 @@ DotNetGraphScanner/
 │   ├── CallGraphWalker.cs          CSharpSyntaxWalker → CALLS edges; records filePath + lineStart
 │   ├── DependencyAnalyzer.cs       Type hierarchy + namespace nodes; records filePath on type nodes
 │   ├── ProjectFileAnalyzer.cs      Parses .csproj for PackageReference/ProjectReference
-│   └── CrossApiExtractor.cs        Extracts per-API cross-API metadata (EPs, outbound calls, BFS impact)
+│   └── CrossApiExtractor.cs        Shared route-matching and virtual-dispatch helpers for canonical dependency analysis
 ├── Export/
 │   ├── IGraphExporter.cs           Common export interface
 │   ├── HtmlExporter.cs             D3.js self-contained HTML output (force graph + hierarchy)
@@ -281,8 +281,7 @@ DotNetGraphScanner/
 │   ├── GraphNode.cs                Node with id, kind, isEntryPoint, meta (incl. filePath, lineStart)
 │   ├── GraphEdge.cs                Directed edge with kind, meta
 │   ├── NodeKind.cs                 Enum of node kinds
-│   ├── EdgeKind.cs                 Enum of edge relationship types (incl. ExternalApiCall)
-│   └── CrossApiModel.cs            Types: EntrypointInfo, ApiCallInfo, SingleApiCrossInfo, …
+│   └── EdgeKind.cs                 Enum of edge relationship types (incl. ExternalApiCall)
 └── Program.cs                      System.CommandLine entry point (scan, render, cross-view, impact)
 
 samples/
@@ -299,26 +298,17 @@ samples/
 
 ### Graph schema in the database
 
-**Cross-API layer** (lightweight, always present after `--push`):
+**Summary metadata**:
 
 | Node | Key property | Description |
 |---|---|---|
-| `(:Api)` | `name` | One node per scanned project; carries `scannedAt` timestamp |
-| `(:EntryPoint)` | `nodeId` | HTTP entry point; carries `httpMethod`, `route`, `apiName` |
-| `(:OutboundCall)` | `nodeId` | An `[ApiCall]`-annotated method; carries `targetApi`, `targetRoute`, `ownerApi` |
+| `(:Api)` | `name` | One node per scanned project; carries `scannedAt` timestamp for summaries and diagnostics |
 
-| Relationship | From → To | Description |
-|---|---|---|
-| `HAS_ENTRY_POINT` | Api → EntryPoint | Ownership |
-| `HAS_OUTBOUND_CALL` | Api → OutboundCall | Ownership |
-| `CAN_REACH` | EntryPoint → OutboundCall | BFS reachability via internal call graph |
-| `RESOLVES_TO` | OutboundCall → EntryPoint | Route-matched cross-API connection |
-
-**Full code graph** (written by `--push`, used by the Code Graph view and `impact` command):
+**Full code graph** (written by `--push`, used by the Code Graph view, API Dependency view, and `impact` command):
 
 | Node | Labels | Key properties |
 |---|---|---|
-| `(:CodeNode:Method)` | `CodeNode` + NodeKind | `id`, `label`, `kind`, `apiName`, `filePath`, `lineStart`, `fullName` |
+| `(:CodeNode:Method)` | `CodeNode` + NodeKind | `id`, `label`, `kind`, `apiName`, `filePath`, `lineStart`, `fullName`, `isEntryPoint`, `httpMethod`, `routeTemplate`, `isApiCall`, `targetApi`, `targetRoute` |
 | `(:CodeNode:Class)` | `CodeNode` + NodeKind | `id`, `label`, `kind`, `apiName`, `filePath`, `namespace`, `fullName` |
 | `(:CodeNode:<Kind>)` | `CodeNode` + NodeKind | All meta key/value pairs from the in-memory graph flattened as properties, plus `scannedAt` |
 
@@ -332,7 +322,8 @@ samples/
 | `PROJECT_REFERENCE` | Project → Project dependency |
 | `PACKAGE_REFERENCE` | Project → NuGet package |
 | `ENTRY_POINT` | Project/parent → entry-point node |
+| `RESOLVES_TO` | Outbound-call method → entry-point method across APIs |
 | `USES_ATTRIBUTE` | Type or method decorated with an attribute class |
 | `EXTERNAL_API_CALL` | Method calls an external API endpoint |
 
-The `apiName` property on every `CodeNode` scopes cleanup — re-scanning an API deletes and rewrites only its own nodes, leaving other APIs untouched.
+The `apiName` property on every `CodeNode` scopes cleanup, and the dependency view derives its cards, connectors, and impact paths directly from `CodeNode` plus structural edges. Re-scanning an API deletes and rewrites only its own nodes, leaving other APIs untouched.
