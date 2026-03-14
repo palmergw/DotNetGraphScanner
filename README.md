@@ -99,6 +99,9 @@ The `cross-api-live.html` page has three views selectable from a dropdown in the
 | **🕸 Code Graph** | Per-API D3 force-directed canvas — select an API from the dropdown to render its full code graph. Filter by node kind or search by label. Click a node for file/line metadata. |
 | **🎯 Impact Explorer** | Enter a file path fragment, function name, or paste a resolved file list to find affected HTTP endpoints across all APIs. For git commit analysis, use the `impact` CLI subcommand instead. |
 
+Implementation note:
+The live explorer now derives API Dependency cards from `CodeNode` and can fall back to `CodeNode.apiName` and `CodeNode.scannedAt` when `(:Api)` nodes have been removed. Legacy `EntryPoint` / `OutboundCall` data is still used as a compatibility fast path when present.
+
 ### `scan --push` options
 
 ```
@@ -317,7 +320,7 @@ samples/
 |---|---|---|
 | `(:CodeNode:Method)` | `CodeNode` + NodeKind | `id`, `label`, `kind`, `apiName`, `filePath`, `lineStart`, `fullName` |
 | `(:CodeNode:Class)` | `CodeNode` + NodeKind | `id`, `label`, `kind`, `apiName`, `filePath`, `namespace`, `fullName` |
-| `(:CodeNode:<Kind>)` | `CodeNode` + NodeKind | All meta key/value pairs from the in-memory graph flattened as properties |
+| `(:CodeNode:<Kind>)` | `CodeNode` + NodeKind | All meta key/value pairs from the in-memory graph flattened as properties, plus `scannedAt` |
 
 | Relationship | Description |
 |---|---|

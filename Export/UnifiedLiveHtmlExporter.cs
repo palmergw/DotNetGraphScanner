@@ -398,8 +398,12 @@ function switchView(mode) {
 // Shared API list (populates Code Graph and Impact dropdowns)
 // ══════════════════════════════════════════════════════════════════════════════
 async function refreshApiList() {
-  const recs = await runQuery(_driver, 'MATCH (a:Api) RETURN a.name AS name ORDER BY a.name');
-  const names = recs.map(r => r.get('name'));
+  const apiRecs = await runQuery(_driver, 'MATCH (a:Api) RETURN a.name AS name ORDER BY a.name');
+  const codeNodeRecs = await runQuery(_driver, 'MATCH (n:CodeNode) WHERE n.apiName IS NOT NULL RETURN DISTINCT n.apiName AS name ORDER BY name');
+  const names = Array.from(new Set([
+    ...apiRecs.map(r => r.get('name')),
+    ...codeNodeRecs.map(r => r.get('name')),
+  ])).sort((a, b) => String(a).localeCompare(String(b)));
   populateSelect('cg-api-select',  names, '— select an API —');
   populateSelect('imp-api-select', names, 'All APIs', true);
 }
@@ -439,24 +443,173 @@ async function refreshApiDeps() {
   initApiDepsRenderer(data);
 }
 
+function depsNormalizePath(path) {
+  return String(path || '').trim().replace(/^\/+|\/+$/g, '').toLowerCase();
+}
+
+function depsRouteTemplatesMatch(template, path) {
+  const normTemplate = depsNormalizePath(template);
+  const normPath = depsNormalizePath(path);
+  if (normTemplate === normPath) return true;
+
+  const tParts = normTemplate.split('/').filter(Boolean);
+  const pParts = normPath.split('/').filter(Boolean);
+  if (tParts.length !== pParts.length) return false;
+
+  for (let i = 0; i < tParts.length; i++) {
+    const t = tParts[i];
+    const p = pParts[i];
+    if (t === p) continue;
+    if ((t.startsWith('{') && t.endsWith('}')) || (p.startsWith('{') && p.endsWith('}'))) continue;
+    return false;
+  }
+  return true;
+}
+
+function depsResolveConnectionsFromCards(entryPoints, outboundCalls) {
+  const epsByApi = {};
+  entryPoints.forEach(ep => {
+    const api = ep.apiName || ep.api;
+    (epsByApi[api] = epsByApi[api] || []).push(ep);
+  });
+
+  return outboundCalls.map(out => {
+    const targetApi = out.targetApi;
+    const target = String(out.targetRoute || '');
+    const parts = target.split(' ', 2).map(p => p.trim()).filter(Boolean);
+    const verb = parts.length > 1 ? parts[0].toUpperCase() : 'HTTP';
+    const path = parts.length > 1 ? parts[1] : parts[0] || '';
+    const candidates = epsByApi[targetApi] || [];
+    const match = candidates.find(ep =>
+      String(ep.httpMethod || 'HTTP').toUpperCase() === verb &&
+      depsRouteTemplatesMatch(ep.route, path));
+
+    return {
+      outboundCallNodeId: out.nodeId,
+      matchedEntrypointNodeId: match ? match.nodeId : null
+    };
+  });
+}
+
+function depsGetMethodSuffix(fullName) {
+  const value = String(fullName || '');
+  const parenIdx = value.indexOf('(');
+  if (parenIdx < 0) return null;
+  const dotBefore = value.lastIndexOf('.', parenIdx - 1);
+  return dotBefore >= 0 ? value.slice(dotBefore + 1) : value;
+}
+
+function depsBuildCanonicalImpacts(entryPoints, outboundCalls, graphNodes, graphEdges) {
+  const nodeById = Object.fromEntries(graphNodes.map(node => [node.id, node]));
+  const successors = {};
+  const typeToMethods = {};
+  const implEdges = [];
+
+  graphEdges.forEach(edge => {
+    if (edge.rel === 'CALLS') {
+      (successors[edge.src] = successors[edge.src] || new Set()).add(edge.tgt);
+      return;
+    }
+
+    if (edge.rel === 'CONTAINS') {
+      const src = nodeById[edge.src];
+      const tgt = nodeById[edge.tgt];
+      if (!src || !tgt) return;
+      if (!['Interface', 'Class', 'Struct'].includes(src.kind) || tgt.kind !== 'Method') return;
+      (typeToMethods[edge.src] = typeToMethods[edge.src] || new Set()).add(edge.tgt);
+      return;
+    }
+
+    if (edge.rel === 'IMPLEMENTS') implEdges.push(edge);
+  });
+
+  implEdges.forEach(edge => {
+    const ifaceMethods = Array.from(typeToMethods[edge.tgt] || []);
+    const classMethods = Array.from(typeToMethods[edge.src] || []);
+    if (!ifaceMethods.length || !classMethods.length) return;
+
+    const classBySig = {};
+    classMethods.forEach(methodId => {
+      const suffix = depsGetMethodSuffix(nodeById[methodId]?.fullName);
+      if (suffix) classBySig[suffix] = methodId;
+    });
+
+    ifaceMethods.forEach(methodId => {
+      const suffix = depsGetMethodSuffix(nodeById[methodId]?.fullName);
+      if (!suffix) return;
+      const targetMethodId = classBySig[suffix];
+      if (!targetMethodId) return;
+      (successors[methodId] = successors[methodId] || new Set()).add(targetMethodId);
+    });
+  });
+
+  const apiCallIds = new Set(outboundCalls.map(call => call.nodeId));
+  return entryPoints.map(ep => {
+    const visited = new Set();
+    const reachable = new Set();
+    const queue = [ep.nodeId];
+
+    while (queue.length) {
+      const current = queue.shift();
+      if (!current || visited.has(current)) continue;
+      visited.add(current);
+      if (apiCallIds.has(current)) reachable.add(current);
+      (successors[current] || []).forEach(nextId => {
+        if (!visited.has(nextId)) queue.push(nextId);
+      });
+    }
+
+    return {
+      entrypointNodeId: ep.nodeId,
+      callNodeIds: Array.from(reachable)
+    };
+  }).filter(impact => impact.callNodeIds.length > 0);
+}
+
 async function loadApiDepsData(driver) {
   const apisRecs = await runQuery(driver, 'MATCH (a:Api) RETURN a.name AS name, a.scannedAt AS scannedAt ORDER BY a.name');
-  const epsRecs  = await runQuery(driver, 'MATCH (a:Api)-[:HAS_ENTRY_POINT]->(e:EntryPoint) RETURN a.name AS apiName, e.nodeId AS nodeId, e.httpMethod AS httpMethod, e.route AS route, e.label AS label');
-  const outsRecs = await runQuery(driver, 'MATCH (a:Api)-[:HAS_OUTBOUND_CALL]->(o:OutboundCall) RETURN a.name AS apiName, o.nodeId AS nodeId, o.targetApi AS targetApi, o.targetRoute AS targetRoute, o.label AS label');
-  const impRecs  = await runQuery(driver, 'MATCH (e:EntryPoint)-[:CAN_REACH]->(o:OutboundCall) RETURN e.nodeId AS epId, o.nodeId AS callId');
-  const connRecs = await runQuery(driver, 'MATCH (o:OutboundCall)-[:RESOLVES_TO]->(e:EntryPoint) RETURN o.nodeId AS outId, e.nodeId AS epId');
+  const codeNodeApiRecs = await runQuery(driver, "MATCH (n:CodeNode) WHERE n.apiName IS NOT NULL AND n.scannedAt IS NOT NULL WITH n.apiName AS name, collect(DISTINCT n.scannedAt) AS scannedTimes RETURN name, scannedTimes[0] AS scannedAt ORDER BY name");
+  const epsRecs  = await runQuery(driver, "MATCH (e:CodeNode) WHERE e.kind = 'Method' AND e.isEntryPoint = 'True' AND e.httpMethod IS NOT NULL AND e.routeTemplate IS NOT NULL RETURN e.apiName AS apiName, e.id AS nodeId, e.httpMethod AS httpMethod, e.routeTemplate AS route, coalesce(e.label, e.httpMethod + ' ' + e.routeTemplate) AS label ORDER BY apiName, route");
+  const outsRecs = await runQuery(driver, "MATCH (o:CodeNode) WHERE o.kind = 'Method' AND o.isApiCall = 'true' AND o.targetApi IS NOT NULL AND o.targetRoute IS NOT NULL RETURN o.apiName AS apiName, o.id AS nodeId, o.targetApi AS targetApi, o.targetRoute AS targetRoute, coalesce(o.label, o.apiName + ' → ' + o.targetApi + ': ' + o.targetRoute) AS label ORDER BY apiName, targetApi, targetRoute");
+  const legacyImpRecs  = await runQuery(driver, 'MATCH (e:EntryPoint)-[:CAN_REACH]->(o:OutboundCall) RETURN e.nodeId AS epId, o.nodeId AS callId');
+  const legacyConnRecs = await runQuery(driver, 'MATCH (o:OutboundCall)-[:RESOLVES_TO]->(e:EntryPoint) RETURN o.nodeId AS outId, e.nodeId AS epId');
 
-  const apiNames = apisRecs.map(r => r.get('name'));
+  const canonicalGraphNodeRecs = legacyImpRecs.length ? [] : await runQuery(driver, "MATCH (n:CodeNode) WHERE n.kind IN ['Method','Class','Interface','Struct'] RETURN n.id AS id, n.kind AS kind, n.fullName AS fullName");
+  const canonicalGraphEdgeRecs = legacyImpRecs.length ? [] : await runQuery(driver, "MATCH (s:CodeNode)-[r]->(t:CodeNode) WHERE type(r) IN ['CALLS','CONTAINS','IMPLEMENTS'] RETURN s.id AS src, type(r) AS rel, t.id AS tgt");
+  const canonicalConnRecs = legacyConnRecs.length ? [] : await runQuery(driver, "MATCH (o:CodeNode)-[:RESOLVES_TO]->(e:CodeNode) WHERE o.kind = 'Method' AND e.kind = 'Method' RETURN o.id AS outId, e.id AS epId");
+
+  const apiNames = Array.from(new Set([
+    ...apisRecs.map(r => r.get('name')),
+    ...codeNodeApiRecs.map(r => r.get('name')),
+    ...epsRecs.map(r => r.get('apiName')),
+    ...outsRecs.map(r => r.get('apiName')),
+  ])).sort((a, b) => String(a).localeCompare(String(b)));
+  const scannedAtByApi = Object.fromEntries(codeNodeApiRecs.map(r => [r.get('name'), r.get('scannedAt')]));
+  apisRecs.forEach(r => { scannedAtByApi[r.get('name')] = r.get('scannedAt'); });
   const epsByApi = {}, outsByApi = {};
   apiNames.forEach(n => { epsByApi[n] = []; outsByApi[n] = []; });
   epsRecs.forEach(r  => { const a = r.get('apiName'); (epsByApi[a]  = epsByApi[a]  || []).push({ nodeId: r.get('nodeId'), httpMethod: r.get('httpMethod'), route: r.get('route'), label: r.get('label') }); });
   outsRecs.forEach(r => { const a = r.get('apiName'); (outsByApi[a] = outsByApi[a] || []).push({ nodeId: r.get('nodeId'), targetApi: r.get('targetApi'), targetRoute: r.get('targetRoute'), label: r.get('label') }); });
 
-  const impMap = {};
-  impRecs.forEach(r => { const ep = r.get('epId'), cl = r.get('callId'); (impMap[ep] = impMap[ep] || []).push(cl); });
-  const impacts = Object.entries(impMap).map(([epId, callIds]) => ({ entrypointNodeId: epId, callNodeIds: callIds }));
-  const connections = connRecs.map(r => ({ outboundCallNodeId: r.get('outId'), matchedEntrypointNodeId: r.get('epId') }));
-  return { apis: apiNames.map(name => ({ name, scannedAt: (apisRecs.find(r => r.get('name') === name) || null)?.get('scannedAt') ?? null, entryPoints: epsByApi[name] || [], outboundCalls: outsByApi[name] || [] })), impacts, connections };
+  const impacts = legacyImpRecs.length
+    ? (() => {
+        const impMap = {};
+        legacyImpRecs.forEach(r => { const ep = r.get('epId'), cl = r.get('callId'); (impMap[ep] = impMap[ep] || []).push(cl); });
+        return Object.entries(impMap).map(([epId, callIds]) => ({ entrypointNodeId: epId, callNodeIds: callIds }));
+      })()
+    : depsBuildCanonicalImpacts(
+        epsRecs.map(r => ({ nodeId: r.get('nodeId') })),
+        outsRecs.map(r => ({ nodeId: r.get('nodeId') })),
+        canonicalGraphNodeRecs.map(r => ({ id: r.get('id'), kind: r.get('kind'), fullName: r.get('fullName') })),
+        canonicalGraphEdgeRecs.map(r => ({ src: r.get('src'), rel: r.get('rel'), tgt: r.get('tgt') })));
+  const connections = legacyConnRecs.length
+    ? legacyConnRecs.map(r => ({ outboundCallNodeId: r.get('outId'), matchedEntrypointNodeId: r.get('epId') }))
+    : canonicalConnRecs.length
+      ? canonicalConnRecs.map(r => ({ outboundCallNodeId: r.get('outId'), matchedEntrypointNodeId: r.get('epId') }))
+      : depsResolveConnectionsFromCards(
+          epsRecs.map(r => ({ apiName: r.get('apiName'), nodeId: r.get('nodeId'), httpMethod: r.get('httpMethod'), route: r.get('route') })),
+          outsRecs.map(r => ({ apiName: r.get('apiName'), nodeId: r.get('nodeId'), targetApi: r.get('targetApi'), targetRoute: r.get('targetRoute') })));
+  return { apis: apiNames.map(name => ({ name, scannedAt: scannedAtByApi[name] ?? null, entryPoints: epsByApi[name] || [], outboundCalls: outsByApi[name] || [] })), impacts, connections };
 }
 
 // ── Renderer (identical logic to static exporter, namespaced to deps-*) ──────

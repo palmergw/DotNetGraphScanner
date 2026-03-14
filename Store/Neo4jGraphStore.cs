@@ -70,6 +70,7 @@ public sealed class Neo4jGraphStore : IAsyncDisposable
     public async Task PushApiAsync(SingleApiCrossInfo info, GraphModel graph, CancellationToken ct = default)
     {
         await using var session = _driver.AsyncSession();
+        var scannedAt = DateTimeOffset.UtcNow.ToString("o");
 
         // 1. Remove existing nodes owned by this API
         await (await session.RunAsync("""
@@ -94,7 +95,7 @@ public sealed class Neo4jGraphStore : IAsyncDisposable
             """,
             new Dictionary<string, object?> {
                 ["apiName"]   = info.ApiName,
-                ["scannedAt"] = DateTimeOffset.UtcNow.ToString("o")
+                ["scannedAt"] = scannedAt
             })).ConsumeAsync();
 
         // 3. Entry points (batched UNWIND)
@@ -173,7 +174,7 @@ public sealed class Neo4jGraphStore : IAsyncDisposable
 
         // 6. Write code-graph nodes (grouped by NodeKind to set dynamic labels)
         var codeNodeCount = graph.Nodes.Count;
-        await WriteCodeNodesAsync(session, graph.Nodes.Values, info.ApiName);
+        await WriteCodeNodesAsync(session, graph.Nodes.Values, info.ApiName, scannedAt);
 
         // 7. Write structural edges (grouped by EdgeKind for relationship type)
         var edgeCount = graph.Edges.Count;
@@ -193,7 +194,8 @@ public sealed class Neo4jGraphStore : IAsyncDisposable
     private static async Task WriteCodeNodesAsync(
         IAsyncSession session,
         IEnumerable<GraphNode> nodes,
-        string apiName)
+        string apiName,
+        string scannedAt)
     {
         // Owned nodes (declared in this API) get a full upsert so re-scans refresh all data.
         // External reference nodes (isExternal=true) are written with ON CREATE only:
@@ -202,14 +204,15 @@ public sealed class Neo4jGraphStore : IAsyncDisposable
         var owned    = nodes.Where(n => !n.Meta.TryGetValue("isExternal", out var e) || e != "true").ToList();
         var external = nodes.Where(n =>  n.Meta.TryGetValue("isExternal", out var e) && e == "true").ToList();
 
-        await WriteNodeBatchAsync(session, owned,    apiName, fullUpsert: true);
-        await WriteNodeBatchAsync(session, external, apiName, fullUpsert: false);
+        await WriteNodeBatchAsync(session, owned,    apiName, scannedAt, fullUpsert: true);
+        await WriteNodeBatchAsync(session, external, apiName, scannedAt, fullUpsert: false);
     }
 
     private static async Task WriteNodeBatchAsync(
         IAsyncSession session,
         IEnumerable<GraphNode> nodes,
         string apiName,
+        string scannedAt,
         bool fullUpsert)
     {
         foreach (var group in nodes.GroupBy(n => n.Kind))
@@ -223,7 +226,8 @@ public sealed class Neo4jGraphStore : IAsyncDisposable
                     ["label"]        = n.Label,
                     ["kind"]         = kindName,
                     ["apiName"]      = apiName,
-                    ["isEntryPoint"] = n.IsEntryPoint.ToString()
+                    ["isEntryPoint"] = n.IsEntryPoint.ToString(),
+                    ["scannedAt"]    = scannedAt
                 };
                 foreach (var (k, v) in n.Meta)
                     props[k] = v;
@@ -401,11 +405,69 @@ public sealed class Neo4jGraphStore : IAsyncDisposable
         foreach (var r in eps)
             Console.WriteLine($"  [{r["api"].As<string>(),-18}] {r["m"].As<string>(),-6} {r["rt"].As<string>()}");
 
-        // 5. Cross-API connections resolved
+        // 5. Legacy vs canonical API dependency card counts
+        Console.WriteLine("\n  ── API dependency card parity ──────────────────────");
+        var legacyEpCounts = await Q("""
+            MATCH (a:Api)-[:HAS_ENTRY_POINT]->(e:EntryPoint)
+            RETURN a.name AS api, count(e) AS cnt
+            ORDER BY api
+            """);
+        var canonicalEpCounts = await Q("""
+            MATCH (e:CodeNode)
+            WHERE e.kind = 'Method'
+              AND e.isEntryPoint = 'True'
+              AND e.httpMethod IS NOT NULL
+              AND e.routeTemplate IS NOT NULL
+            RETURN e.apiName AS api, count(e) AS cnt
+            ORDER BY api
+            """);
+        var legacyOutCounts = await Q("""
+            MATCH (a:Api)-[:HAS_OUTBOUND_CALL]->(o:OutboundCall)
+            RETURN a.name AS api, count(o) AS cnt
+            ORDER BY api
+            """);
+        var canonicalOutCounts = await Q("""
+            MATCH (o:CodeNode)
+            WHERE o.kind = 'Method'
+              AND o.isApiCall = 'true'
+              AND o.targetApi IS NOT NULL
+              AND o.targetRoute IS NOT NULL
+            RETURN o.apiName AS api, count(o) AS cnt
+            ORDER BY api
+            """);
+
+        static Dictionary<string, long> ToCountMap(IEnumerable<IRecord> rows) => rows
+            .GroupBy(r => r["api"].As<string>(), StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(g => g.Key, g => g.First()["cnt"].As<long>(), StringComparer.OrdinalIgnoreCase);
+
+        var legacyEpMap = ToCountMap(legacyEpCounts);
+        var canonicalEpMap = ToCountMap(canonicalEpCounts);
+        var legacyOutMap = ToCountMap(legacyOutCounts);
+        var canonicalOutMap = ToCountMap(canonicalOutCounts);
+        var parityApis = legacyEpMap.Keys
+            .Union(canonicalEpMap.Keys, StringComparer.OrdinalIgnoreCase)
+            .Union(legacyOutMap.Keys, StringComparer.OrdinalIgnoreCase)
+            .Union(canonicalOutMap.Keys, StringComparer.OrdinalIgnoreCase)
+            .OrderBy(a => a, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        if (parityApis.Count == 0)
+            Console.WriteLine("  (no API dependency cards found)");
+        foreach (var api in parityApis)
+        {
+            var legacyEp = legacyEpMap.GetValueOrDefault(api, 0);
+            var canonEp = canonicalEpMap.GetValueOrDefault(api, 0);
+            var legacyOut = legacyOutMap.GetValueOrDefault(api, 0);
+            var canonOut = canonicalOutMap.GetValueOrDefault(api, 0);
+            var marker = legacyEp == canonEp && legacyOut == canonOut ? "✓" : "✗";
+            Console.WriteLine($"  {marker} [{api,-18}] entry legacy={legacyEp,-3} canonical={canonEp,-3} | outbound legacy={legacyOut,-3} canonical={canonOut,-3}");
+        }
+
+        // 6. Cross-API connections resolved
         var connCount = await Q("MATCH ()-[r:RESOLVES_TO]->() RETURN count(r) AS cnt");
         Console.WriteLine($"\n  ── Cross-API resolved connections: {connCount[0]["cnt"].As<long>()} ──────────");
 
-        // 6. ApiCallAttribute node check
+        // 7. ApiCallAttribute node check
         Console.WriteLine("\n  ── ApiCallAttribute node ────────────────────────────");
         var attrNodes = await Q("MATCH (n:CodeNode {label:'ApiCallAttribute'}) RETURN n.apiName AS api, n.kind AS kind, n.filePath AS fp");
         if (attrNodes.Count == 0)
@@ -413,7 +475,7 @@ public sealed class Neo4jGraphStore : IAsyncDisposable
         foreach (var r in attrNodes)
             Console.WriteLine($"  ✓ apiName={r["api"].As<string>()}  kind={r["kind"].As<string>()}  filePath={r["fp"].As<string>()}");
 
-        // 7. Duplicate CodeNode id check
+        // 8. Duplicate CodeNode id check
         Console.WriteLine("\n  ── Duplicate CodeNode ids (should be empty) ──────────");
         var dups = await Q("""
             MATCH (n:CodeNode)
@@ -426,7 +488,7 @@ public sealed class Neo4jGraphStore : IAsyncDisposable
         foreach (var r in dups)
             Console.WriteLine($"  ⚠ id={r["id"].As<string>()[..Math.Min(60, r["id"].As<string>().Length)]}  cnt={r["cnt"].As<long>()}");
 
-        // 8. Property nodes from Models.cs - do they have filePath?
+        // 9. Property nodes from Models.cs - do they have filePath?
         var props = await Q("""
             MATCH (n:CodeNode {kind:'Property'})
             WHERE n.filePath IS NOT NULL
@@ -452,7 +514,7 @@ public sealed class Neo4jGraphStore : IAsyncDisposable
             Console.WriteLine($"    {rawFp}");
         }
 
-        // 9. Direct path: entry point → ACCESSES → Models.cs property (1 hop)
+                // 10. Direct path: entry point → ACCESSES → Models.cs property (1 hop)
         var direct = await Q("""
             MATCH (ep:CodeNode {isEntryPoint:'True'})-[:ACCESSES]->(n:CodeNode)
             WHERE n.filePath IS NOT NULL
@@ -470,7 +532,7 @@ public sealed class Neo4jGraphStore : IAsyncDisposable
             Console.WriteLine($"  [{r["api"].As<string>(),-14}] {r["rt"].As<string>(),-28} → {r["node"].As<string>()}");
         }
 
-        // 10. Paths via intermediate methods (2-3 hops)
+                // 11. Paths via intermediate methods (2-3 hops)
         var indirect = await Q("""
             MATCH (ep:CodeNode {isEntryPoint:'True'})-[:CALLS|ACCESSES*2..4]->(n:CodeNode)
             WHERE n.filePath IS NOT NULL
@@ -485,7 +547,7 @@ public sealed class Neo4jGraphStore : IAsyncDisposable
         foreach (var r in indirect)
             Console.WriteLine($"  [{r["api"].As<string>(),-14}] {r["rt"].As<string>(),-28} → {r["node"].As<string>()}");
 
-        // 11. Smoke-test impact query for Models.cs (FooApi)
+        // 12. Smoke-test impact query for Models.cs (FooApi)
         Console.WriteLine("\n  ── Impact smoke-test: 'models.cs' ───────────────────");
         try
         {
