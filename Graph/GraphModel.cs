@@ -22,6 +22,11 @@ public sealed class GraphModel
         if (_nodes.TryGetValue(id, out var existing))
         {
             if (isEntryPoint) existing.IsEntryPoint = true;
+            if (meta is not null)
+            {
+                foreach (var (key, value) in meta)
+                    existing.Meta[key] = value;
+            }
             return existing;
         }
 

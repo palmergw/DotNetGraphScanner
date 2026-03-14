@@ -3,6 +3,7 @@ using Microsoft.Build.Locator;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.MSBuild;
 using System.Linq;
+using System.Xml.Linq;
 
 namespace DotNetGraphScanner.Analysis;
 
@@ -24,6 +25,7 @@ public sealed class SolutionAnalyzer
 
         var graph = new GraphModel();
         var path = Path.GetFullPath(_options.InputPath);
+        var scanScope = Path.GetFileNameWithoutExtension(path);
 
         Console.WriteLine($"Opening: {path}");
 
@@ -41,32 +43,25 @@ public sealed class SolutionAnalyzer
         {
             var solutionNodeId = $"solution:{path.ToLowerInvariant()}";
             graph.AddNode(solutionNodeId, Path.GetFileNameWithoutExtension(path),
-                NodeKind.Solution, meta: new() { ["path"] = path });
+                NodeKind.Solution, meta: new()
+                {
+                    ["path"] = path,
+                    ["scanScope"] = scanScope,
+                    ["rootKind"] = "Solution",
+                    ["inputType"] = "sln",
+                    ["isSyntheticRoot"] = "false"
+                });
 
             solution = await workspace.OpenSolutionAsync(path, cancellationToken: ct);
 
             foreach (var project in solution.Projects)
-                await AnalyzeProjectAsync(project, graph, solutionNodeId, ct);
+                await AnalyzeProjectAsync(project, graph, solutionNodeId, scanScope, ct);
         }
         else if (path.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase) ||
                  path.EndsWith(".vbproj", StringComparison.OrdinalIgnoreCase))
         {
             var project = await workspace.OpenProjectAsync(path, cancellationToken: ct);
-            var projNodeId = ProjectNodeId(path);
-            graph.AddNode(projNodeId, project.Name, NodeKind.Project, meta: new()
-            {
-                ["path"] = path,
-                ["language"] = project.Language
-            });
-
-            // Add to a synthetic root – ID is unique per project so that multiple
-            // .csproj pushes don't collapse onto the same node in the database.
-            var projName = Path.GetFileNameWithoutExtension(path);
-            var rootId   = $"solution:csproj:{projName.ToLowerInvariant()}";
-            graph.AddNode(rootId, projName, NodeKind.Solution);
-            graph.AddEdge(rootId, projNodeId, EdgeKind.Contains);
-
-            await AnalyzeProjectAsync(project, graph, rootId, ct);
+            await AnalyzeProjectAsync(project, graph, parentId: null, scanScope, ct);
         }
         else
         {
@@ -83,7 +78,8 @@ public sealed class SolutionAnalyzer
     private async Task AnalyzeProjectAsync(
         Project project,
         GraphModel graph,
-        string parentId,
+        string? parentId,
+        string scanScope,
         CancellationToken ct)
     {
         var projId = ProjectNodeId(project.FilePath!);
@@ -91,15 +87,23 @@ public sealed class SolutionAnalyzer
         {
             ["path"] = project.FilePath ?? "",
             ["language"] = project.Language,
-            ["assemblyName"] = project.AssemblyName
+            ["assemblyName"] = project.AssemblyName ?? project.Name,
+            ["scanScope"] = scanScope,
+            ["rootKind"] = "Project",
+            ["inputType"] = Path.GetExtension(project.FilePath ?? string.Empty).TrimStart('.').ToLowerInvariant(),
+            ["projectKind"] = "Unknown",
+            ["discoverySource"] = "AnalyzedProject",
+            ["isPlaceholder"] = "false",
+            ["isAnalyzedProject"] = "true"
         });
-        graph.AddEdge(parentId, projId, EdgeKind.Contains);
+        if (!string.IsNullOrEmpty(parentId))
+            graph.AddEdge(parentId, projId, EdgeKind.Contains);
 
         Console.WriteLine($"  Project: {project.Name} ({project.DocumentIds.Count} documents)");
 
         // Static csproj analysis (NuGet + project refs) – fast, no compilation needed
         if (!string.IsNullOrEmpty(project.FilePath))
-            ProjectFileAnalyzer.Analyze(project.FilePath, projId, graph);
+            ProjectFileAnalyzer.Analyze(project.FilePath, projId, scanScope, project.Name, graph);
 
         // Roslyn compilation (needed for semantic analysis)
         Compilation? compilation = null;
@@ -139,10 +143,116 @@ public sealed class SolutionAnalyzer
                 walker.Visit(await tree.GetRootAsync(ct));
             }
         }
+
+        var projectKind = ClassifyProject(project, graph, projId);
+        var projectNode = graph.Nodes[projId];
+        projectNode.Meta["projectKind"] = projectKind;
+        projectNode.Meta["declaringProject"] = project.Name;
+
+        AnnotateProjectSubgraph(graph, projId, project.Name, projectKind, scanScope);
     }
 
     private static string ProjectNodeId(string path) =>
         $"project:{path.ToLowerInvariant()}";
+
+    private static void AnnotateProjectSubgraph(
+        GraphModel graph,
+        string projectId,
+        string projectName,
+        string projectKind,
+        string scanScope)
+    {
+        if (!graph.Nodes.TryGetValue(projectId, out var projectNode))
+            return;
+
+        projectNode.Meta["scanScope"] = scanScope;
+        projectNode.Meta["declaringProject"] = projectName;
+        projectNode.Meta["projectKind"] = projectKind;
+
+        var containsBySource = graph.Edges
+            .Where(edge => edge.Kind == EdgeKind.Contains)
+            .GroupBy(edge => edge.SourceId, StringComparer.Ordinal)
+            .ToDictionary(group => group.Key, group => group.Select(edge => edge.TargetId).ToList(), StringComparer.Ordinal);
+
+        var visited = new HashSet<string>(StringComparer.Ordinal) { projectId };
+        var queue = new Queue<string>();
+        queue.Enqueue(projectId);
+
+        while (queue.Count > 0)
+        {
+            var currentId = queue.Dequeue();
+            if (!containsBySource.TryGetValue(currentId, out var children))
+                continue;
+
+            foreach (var childId in children)
+            {
+                if (!visited.Add(childId))
+                    continue;
+
+                if (graph.Nodes.TryGetValue(childId, out var child))
+                {
+                    child.Meta["scanScope"] = scanScope;
+                    child.Meta["declaringProject"] = projectName;
+                }
+
+                queue.Enqueue(childId);
+            }
+        }
+    }
+
+    private static string ClassifyProject(Project project, GraphModel graph, string projectId)
+    {
+        var (sdk, outputType) = ReadProjectFileMetadata(project.FilePath);
+        var hasHttpSurface = graph.Edges.Any(edge =>
+            edge.SourceId == projectId &&
+            edge.Kind == EdgeKind.EntryPoint &&
+            graph.Nodes.TryGetValue(edge.TargetId, out var node) &&
+            node.Meta.ContainsKey("httpMethod") &&
+            node.Meta.ContainsKey("routeTemplate"));
+
+        if (hasHttpSurface || sdk.Contains("Microsoft.NET.Sdk.Web", StringComparison.OrdinalIgnoreCase))
+            return "HttpApi";
+
+        if (sdk.Contains("Worker", StringComparison.OrdinalIgnoreCase))
+            return "Worker";
+
+        if (string.Equals(outputType, "Exe", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(outputType, "WinExe", StringComparison.OrdinalIgnoreCase))
+            return "Executable";
+
+        if (string.IsNullOrWhiteSpace(outputType) ||
+            string.Equals(outputType, "Library", StringComparison.OrdinalIgnoreCase))
+            return "Library";
+
+        return "Unknown";
+    }
+
+    private static (string Sdk, string OutputType) ReadProjectFileMetadata(string? projectFilePath)
+    {
+        if (string.IsNullOrWhiteSpace(projectFilePath) || !File.Exists(projectFilePath))
+            return (string.Empty, string.Empty);
+
+        try
+        {
+            var doc = XDocument.Load(projectFilePath);
+            var root = doc.Root;
+            if (root is null)
+                return (string.Empty, string.Empty);
+
+            var sdk = root.Attribute("Sdk")?.Value ?? string.Empty;
+            var outputType = root.Descendants()
+                .FirstOrDefault(element => string.Equals(element.Name.LocalName, "OutputType", StringComparison.OrdinalIgnoreCase))
+                ?.Value
+                ?.Trim()
+                ?? string.Empty;
+
+            return (sdk, outputType);
+        }
+        catch
+        {
+            return (string.Empty, string.Empty);
+        }
+    }
 
     /// <summary>
     /// Post-processing: adds Contains edges from NuGet package nodes to any external

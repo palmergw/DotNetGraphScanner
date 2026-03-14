@@ -9,7 +9,12 @@ namespace DotNetGraphScanner.Analysis;
 /// </summary>
 public static class ProjectFileAnalyzer
 {
-    public static void Analyze(string csprojPath, string projectNodeId, GraphModel graph)
+    public static void Analyze(
+        string csprojPath,
+        string projectNodeId,
+        string scanScope,
+        string referencingProject,
+        GraphModel graph)
     {
         if (!File.Exists(csprojPath)) return;
 
@@ -55,7 +60,14 @@ public static class ProjectFileAnalyzer
 
             graph.AddNode(refId, refName, NodeKind.Project, meta: new()
             {
-                ["path"] = absPath
+                ["path"] = absPath,
+                ["scanScope"] = scanScope,
+                ["rootKind"] = "Project",
+                ["projectKind"] = "Unknown",
+                ["discoverySource"] = "ProjectReference",
+                ["isPlaceholder"] = "true",
+                ["isAnalyzedProject"] = "false",
+                ["referencedByProject"] = referencingProject
             });
             graph.AddEdge(projectNodeId, refId, EdgeKind.ProjectReference);
         }
