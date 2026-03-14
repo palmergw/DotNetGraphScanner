@@ -10,7 +10,7 @@ namespace DotNetGraphScanner.Store;
 ///
 /// Graph schema:
 ///   (:Api      { name, scannedAt })
-///   (:CodeNode { id, kind, apiName, ... })
+///   (:CodeNode { id, kind, scanScope, apiName?, ... })
 ///   (:CodeNode)-[:RESOLVES_TO]->(:CodeNode)
 /// </summary>
 public sealed class Neo4jGraphStore : IAsyncDisposable
@@ -88,21 +88,21 @@ public sealed class Neo4jGraphStore : IAsyncDisposable
     // ── Write ─────────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Pushes a single API's full graph to the database, overwriting any previous
+    /// Pushes a single scan scope's full graph to the database, overwriting any previous
     /// canonical CodeNode data for that API. After writing structural data, the
     /// store re-resolves canonical cross-API connections.
     /// </summary>
-    public async Task PushApiAsync(string apiName, GraphModel graph, CancellationToken ct = default)
+    public async Task PushApiAsync(string scanScope, GraphModel graph, CancellationToken ct = default)
     {
         await using var session = _driver.AsyncSession();
         var scannedAt = DateTimeOffset.UtcNow.ToString("o");
 
-        // 1b. Remove stale code nodes for this API
+        // 1b. Remove stale code nodes for this scan scope
         await (await session.RunAsync("""
-            MATCH (n:CodeNode {apiName: $apiName})
+            MATCH (n:CodeNode {scanScope: $scanScope})
             DETACH DELETE n
             """,
-            new Dictionary<string, object?> { ["apiName"] = apiName })).ConsumeAsync();
+            new Dictionary<string, object?> { ["scanScope"] = scanScope })).ConsumeAsync();
 
         // 2. Upsert the Api node
         await (await session.RunAsync("""
@@ -110,13 +110,13 @@ public sealed class Neo4jGraphStore : IAsyncDisposable
             SET a.scannedAt = $scannedAt
             """,
             new Dictionary<string, object?> {
-                ["apiName"]   = apiName,
+                ["apiName"]   = scanScope,
                 ["scannedAt"] = scannedAt
             })).ConsumeAsync();
 
         // 3. Write code-graph nodes (grouped by NodeKind to set dynamic labels)
         var codeNodeCount = graph.Nodes.Count;
-        await WriteCodeNodesAsync(session, graph.Nodes.Values, apiName, scannedAt);
+        await WriteCodeNodesAsync(session, graph.Nodes.Values, scanScope, scannedAt);
 
         // 4. Write structural edges (grouped by EdgeKind for relationship type)
         var edgeCount = graph.Edges.Count;
@@ -134,7 +134,7 @@ public sealed class Neo4jGraphStore : IAsyncDisposable
             node.Meta.ContainsKey("targetApi") &&
             node.Meta.ContainsKey("targetRoute"));
 
-        Console.WriteLine($"  Neo4j ← {apiName} " +
+        Console.WriteLine($"  Neo4j ← {scanScope} " +
             $"({entryPointCount} EPs, {outboundCallCount} outbound calls, " +
             $"{codeNodeCount} code nodes, {edgeCount} structural edges)");
 
@@ -147,24 +147,24 @@ public sealed class Neo4jGraphStore : IAsyncDisposable
     private static async Task WriteCodeNodesAsync(
         IAsyncSession session,
         IEnumerable<GraphNode> nodes,
-        string apiName,
+        string scanScope,
         string scannedAt)
     {
         // Owned nodes (declared in this API) get a full upsert so re-scans refresh all data.
         // External reference nodes (isExternal=true) are written with ON CREATE only:
-        // once a node is claimed by its owning API, later pushes from other APIs must not
-        // overwrite its apiName (e.g. ApiCallAttribute belongs to ApiContracts, not FooApi).
+        // once a node is claimed by its owning scan scope, later pushes from other scans must not
+        // overwrite its ownership metadata (e.g. ApiCallAttribute belongs to ApiContracts, not FooApi).
         var owned    = nodes.Where(n => !n.Meta.TryGetValue("isExternal", out var e) || e != "true").ToList();
         var external = nodes.Where(n =>  n.Meta.TryGetValue("isExternal", out var e) && e == "true").ToList();
 
-        await WriteNodeBatchAsync(session, owned,    apiName, scannedAt, fullUpsert: true);
-        await WriteNodeBatchAsync(session, external, apiName, scannedAt, fullUpsert: false);
+        await WriteNodeBatchAsync(session, owned,    scanScope, scannedAt, fullUpsert: true);
+        await WriteNodeBatchAsync(session, external, scanScope, scannedAt, fullUpsert: false);
     }
 
     private static async Task WriteNodeBatchAsync(
         IAsyncSession session,
         IEnumerable<GraphNode> nodes,
-        string apiName,
+        string scanScope,
         string scannedAt,
         bool fullUpsert)
     {
@@ -173,17 +173,27 @@ public sealed class Neo4jGraphStore : IAsyncDisposable
             var kindName = group.Key.ToString();
             var batch = group.Select(n =>
             {
+                var nodeScanScope = n.Meta.TryGetValue("scanScope", out var scope) && !string.IsNullOrWhiteSpace(scope)
+                    ? scope
+                    : scanScope;
                 var props = new Dictionary<string, object?>
                 {
                     ["id"]           = n.Id,
                     ["label"]        = n.Label,
                     ["kind"]         = kindName,
-                    ["apiName"]      = apiName,
+                    ["scanScope"]    = nodeScanScope,
                     ["isEntryPoint"] = n.IsEntryPoint.ToString(),
                     ["scannedAt"]    = scannedAt
                 };
                 foreach (var (k, v) in n.Meta)
                     props[k] = v;
+
+                var semanticApiName = DetermineSemanticApiName(n, nodeScanScope);
+                if (!string.IsNullOrWhiteSpace(semanticApiName))
+                    props["apiName"] = semanticApiName;
+                else
+                    props.Remove("apiName");
+
                 return (object)props;
             }).ToList<object>();
 
@@ -209,6 +219,34 @@ public sealed class Neo4jGraphStore : IAsyncDisposable
             await (await session.RunAsync(query,
                 new Dictionary<string, object?> { ["batch"] = batch })).ConsumeAsync();
         }
+    }
+
+    private static string? DetermineSemanticApiName(GraphNode node, string scanScope)
+    {
+        if (node.Meta.TryGetValue("apiName", out var explicitApiName) && !string.IsNullOrWhiteSpace(explicitApiName))
+            return explicitApiName;
+
+        var declaringProject = node.Meta.TryGetValue("declaringProject", out var project) && !string.IsNullOrWhiteSpace(project)
+            ? project
+            : scanScope;
+
+        var isApiBearingMethod = node.Kind == NodeKind.Method && (
+            (node.IsEntryPoint && node.Meta.ContainsKey("httpMethod") && node.Meta.ContainsKey("routeTemplate")) ||
+            (node.Meta.TryGetValue("isApiCall", out var isApiCall) &&
+             string.Equals(isApiCall, "true", StringComparison.OrdinalIgnoreCase) &&
+             node.Meta.ContainsKey("targetApi") &&
+             node.Meta.ContainsKey("targetRoute")));
+
+        if (isApiBearingMethod)
+            return declaringProject;
+
+        var isApiRoot = node.Kind == NodeKind.Project &&
+            node.Meta.TryGetValue("isAnalyzedProject", out var isAnalyzedProject) &&
+            string.Equals(isAnalyzedProject, "true", StringComparison.OrdinalIgnoreCase) &&
+            node.Meta.TryGetValue("projectKind", out var projectKind) &&
+            string.Equals(projectKind, "HttpApi", StringComparison.OrdinalIgnoreCase);
+
+        return isApiRoot ? declaringProject : null;
     }
 
     private static async Task WriteStructuralEdgesAsync(
@@ -320,29 +358,29 @@ public sealed class Neo4jGraphStore : IAsyncDisposable
         foreach (var r in apis)
             Console.WriteLine($"  • {r["name"].As<string>(),-24}  scanned {r["ts"].As<string>()}");
 
-        // 2. CodeNode counts per API
-        Console.WriteLine("\n  ── CodeNode counts ──────────────────────────────────");
+        // 2. CodeNode counts per scan scope
+        Console.WriteLine("\n  ── CodeNode counts by scanScope ─────────────────────");
         var cnCounts = await Q("""
             MATCH (n:CodeNode)
-            RETURN n.apiName AS api, n.kind AS kind, count(n) AS cnt
-            ORDER BY api, kind
+            RETURN coalesce(n.scanScope, '<missing>') AS scope, n.kind AS kind, count(n) AS cnt
+            ORDER BY scope, kind
             """);
         if (cnCounts.Count == 0)
             Console.WriteLine("  (no CodeNodes)");
-        var byApi = cnCounts.GroupBy(r => r["api"].As<string>());
-        foreach (var g in byApi)
+        var byScope = cnCounts.GroupBy(r => r["scope"].As<string>());
+        foreach (var g in byScope)
         {
             Console.WriteLine($"  {g.Key}:");
             foreach (var r in g)
                 Console.WriteLine($"    {r["kind"].As<string>(),-16} {r["cnt"].As<long>(),5}");
         }
 
-        // 3. Solution root nodes (check none are shared across APIs)
+        // 3. Solution root nodes (should exist only for real .sln inputs)
         Console.WriteLine("\n  ── Solution root nodes ──────────────────────────────");
-        var roots = await Q("MATCH (n:CodeNode {kind:'Solution'}) RETURN n.id AS id, n.label AS lbl, n.apiName AS api ORDER BY api");
+        var roots = await Q("MATCH (n:CodeNode {kind:'Solution'}) RETURN n.id AS id, n.label AS lbl, n.scanScope AS scope ORDER BY scope");
         if (roots.Count == 0) Console.WriteLine("  (none)");
         foreach (var r in roots)
-            Console.WriteLine($"  id={r["id"].As<string>(),-40}  api={r["api"].As<string>()}  label={r["lbl"].As<string>()}");
+            Console.WriteLine($"  id={r["id"].As<string>(),-40}  scope={r["scope"].As<string>()}  label={r["lbl"].As<string>()}");
         var sharedRoots = roots.GroupBy(r => r["id"].As<string>()).Where(g => g.Count() > 1).ToList();
         if (sharedRoots.Count > 0)
             Console.WriteLine($"  ⚠ {sharedRoots.Count} root ID(s) shared across multiple scans — rescan all APIs to fix.");
@@ -534,11 +572,11 @@ public sealed class Neo4jGraphStore : IAsyncDisposable
 
         // 8. ApiCallAttribute node check
         Console.WriteLine("\n  ── ApiCallAttribute node ────────────────────────────");
-        var attrNodes = await Q("MATCH (n:CodeNode {label:'ApiCallAttribute'}) RETURN n.apiName AS api, n.kind AS kind, n.filePath AS fp");
+        var attrNodes = await Q("MATCH (n:CodeNode {label:'ApiCallAttribute'}) RETURN n.scanScope AS scope, n.declaringProject AS project, n.apiName AS api, n.kind AS kind, n.filePath AS fp");
         if (attrNodes.Count == 0)
             Console.WriteLine("  ✗ NOT FOUND – scan ApiContracts with --push");
         foreach (var r in attrNodes)
-            Console.WriteLine($"  ✓ apiName={r["api"].As<string>()}  kind={r["kind"].As<string>()}  filePath={r["fp"].As<string>()}");
+            Console.WriteLine($"  ✓ scanScope={r["scope"].As<string>()}  declaringProject={r["project"].As<string>()}  apiName={r["api"].As<string?>() ?? "<null>"}  kind={r["kind"].As<string>()}  filePath={r["fp"].As<string>()}");
 
         // 9. Duplicate CodeNode id check
         Console.WriteLine("\n  ── Duplicate CodeNode ids (should be empty) ──────────");
@@ -558,8 +596,8 @@ public sealed class Neo4jGraphStore : IAsyncDisposable
             MATCH (n:CodeNode {kind:'Property'})
             WHERE n.filePath IS NOT NULL
               AND toLower(n.filePath) CONTAINS 'models'
-            RETURN n.label AS lbl, n.filePath AS fp, n.apiName AS api
-            ORDER BY api, lbl LIMIT 20
+                        RETURN n.label AS lbl, n.filePath AS fp, coalesce(n.scanScope, n.apiName) AS scope
+                        ORDER BY scope, lbl LIMIT 20
             """);
         Console.WriteLine($"\n  ── Property nodes in Models file ({props.Count}) ────────────");
         if (props.Count == 0)
@@ -569,7 +607,7 @@ public sealed class Neo4jGraphStore : IAsyncDisposable
             var fp = r["fp"].As<string>();
             // Show last 3 path segments with forward slashes for readability
             var fpShort = fp.Replace('\\', '/').Split('/').TakeLast(3).Aggregate((a,b) => a+"/"+b);
-            Console.WriteLine($"  [{r["api"].As<string>(),-14}] {r["lbl"].As<string>(),-18}  {fpShort}");
+            Console.WriteLine($"  [{r["scope"].As<string>(),-14}] {r["lbl"].As<string>(),-18}  {fpShort}");
         }
         // Show one raw full path so we know exactly what to search for in the UI
         if (props.Count > 0)
